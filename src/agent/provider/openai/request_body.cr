@@ -12,12 +12,17 @@ class Agent
           max_tokens : Int32?,
           temperature : Float64?,
           cache_key : String?,
+          include_usage : Bool = true,
         ) : Hash(String, JSON::Any)
           body = {
             "model"    => JSON::Any.new(model),
             "messages" => JSON::Any.new(messages.map { |m| message_to_request_body(m) }.map { |h| JSON::Any.new(h) }),
             "stream"   => JSON::Any.new(true),
           }
+
+          if include_usage
+            body["stream_options"] = JSON::Any.new({"include_usage" => JSON::Any.new(true)})
+          end
 
           # Only send prompt_cache_key if it was explicitly configured.
           # Non-OpenAI providers may reject unknown fields.

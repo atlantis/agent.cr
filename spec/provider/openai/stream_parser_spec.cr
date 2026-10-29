@@ -487,3 +487,37 @@ describe Agent::Provider::OpenAI::StreamParser do
     tcs[0].arguments.should eq(%({"path":"x"}))
   end
 end
+
+describe Agent::Provider::OpenAI::StreamParser do
+  it "reads cached_tokens from prompt_tokens_details" do
+    response = Agent::Response.new
+    lines = [
+      %(data: {"choices":[{"delta":{"content":"ok"},"index":0,"finish_reason":"stop"}]}),
+      %(data: {"choices":[],"usage":{"prompt_tokens":120,"completion_tokens":3,"total_tokens":123,"prompt_tokens_details":{"cached_tokens":100}}}),
+      "data: [DONE]",
+    ]
+    io = IO::Memory.new(lines.join('\n'))
+    _msg, usage, _finish = Agent::Provider::OpenAI::StreamParser.parse(io, response, -> { false })
+    usage.prompt_tokens.should eq(120)
+    usage.cached_tokens.should eq(100)
+    usage.cache_creation_tokens.should be_nil
+  end
+end
+
+describe Agent::Provider::OpenAI::RequestBody do
+  it "asks for usage on the stream unless told not to" do
+    messages = [Agent::Message.user("hi")]
+    body = Agent::Provider::OpenAI::RequestBody.build(messages, nil, "m", nil, nil, nil)
+    body["stream_options"].as_h["include_usage"].as_bool.should be_true
+
+    body = Agent::Provider::OpenAI::RequestBody.build(messages, nil, "m", nil, nil, nil, include_usage: false)
+    body.has_key?("stream_options").should be_false
+  end
+
+  it "takes include_usage from the config" do
+    config = Agent::Config.new(api_key: "k", include_usage: false)
+    provider = Agent::Provider::OpenAI.new(config, "cache")
+    request = provider.build_request([Agent::Message.user("hi")], nil)
+    JSON.parse(request[:body]).as_h.has_key?("stream_options").should be_false
+  end
+end

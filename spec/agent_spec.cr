@@ -4,6 +4,13 @@ require "./spec_helper"
 # This avoids external HTTP calls and makes tests deterministic.
 
 # A minimal mock server that speaks the OpenAI streaming format.
+# the loop's tool execution is private; the spec reaches it through this seam
+class Agent
+  def execute_registered_tools_for_spec(calls, response)
+    execute_registered_tools(calls, response)
+  end
+end
+
 def with_mock_server(&)
   server = HTTP::Server.new do |ctx|
     if ctx.request.method == "POST" && ctx.request.path.includes?("/chat/completions")
@@ -988,6 +995,24 @@ describe Agent do
     end
   end
 
+  it "marks the tool results it builds for failed calls as errors" do
+    agent = Agent.new(Agent::Config.new(api_key: "k"))
+    agent.register_tool("boom", "fails", parameters: Agent::JSONConverter.from({type: "object", properties: {n: {type: "integer"}}, required: ["n"]})) do |_args|
+      raise "no"
+    end
+    response = Agent::Response.new
+    calls = [
+      Agent::ToolCall.new("c1", "boom", %({"n":1})),
+      Agent::ToolCall.new("c2", "boom", %({"n":"x"})),
+      Agent::ToolCall.new("c3", "boom", "{not json"),
+    ]
+    results = agent.execute_registered_tools_for_spec(calls, response)
+    results.map(&.error?).should eq([true, true, true])
+    results[0].content.to_s.should contain("Error executing tool")
+    results[1].content.to_s.should contain("Error validating arguments")
+    results[2].content.to_s.should contain("invalid JSON")
+  end
+
   describe "#trim_history!" do
     it "trims history without orphaning tool messages" do
       # A more complex mock server that:
@@ -1087,6 +1112,41 @@ describe Agent do
       ensure
         server.close
       end
+    end
+  end
+
+  it "drops whole turns, so a kept history starts at a user message" do
+    with_mock_server do |port|
+      config = Agent::Config.new(
+        api_key: "test-key",
+        api_endpoint: "http://localhost:#{port}",
+        max_history: 2,
+      )
+      agent = Agent.new(config)
+      tc = Agent::ToolCall.new("call_1", "lookup", "{}")
+      # three turns, the first two with tool calls: 2 + 4 + 3 = 9 messages,
+      # 6 of them user or assistant
+      agent.load_history([
+        Agent::Message.user("one"),
+        Agent::Message.assistant("1"),
+        Agent::Message.user("two"),
+        Agent::Message.assistant(nil, tool_calls: [tc]),
+        Agent::Message.tool_result(tc, "found"),
+        Agent::Message.assistant("2"),
+        Agent::Message.user("three"),
+        Agent::Message.assistant(nil, tool_calls: [tc]),
+        Agent::Message.tool_result(tc, "found again"),
+      ])
+
+      agent.ask("four").join
+
+      # the oldest two turns are gone; the third, tool calls and all, stays with the new one
+      agent.history.map(&.role).should eq([
+        Agent::Role::User, Agent::Role::Assistant, Agent::Role::Tool,
+        Agent::Role::User, Agent::Role::Assistant,
+      ])
+      agent.history[0].content.should eq("three")
+      agent.history[3].content.should eq("four")
     end
   end
 

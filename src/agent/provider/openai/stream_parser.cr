@@ -266,10 +266,12 @@ class Agent
         private def parse_usage(parsed : Hash(String, JSON::Any), prev_usage : Usage) : Usage
           if usage_data = parsed["usage"]?
             if u = usage_data.as_h?
+              cached = u["prompt_tokens_details"]?.try(&.as_h?).try(&.["cached_tokens"]?).try(&.as_i?)
               return Usage.new(
                 prompt_tokens: u["prompt_tokens"]?.try(&.as_i),
                 completion_tokens: u["completion_tokens"]?.try(&.as_i),
-                total_tokens: u["total_tokens"]?.try(&.as_i)
+                total_tokens: u["total_tokens"]?.try(&.as_i),
+                cached_tokens: cached,
               )
             end
           elsif timings = parsed["timings"]?

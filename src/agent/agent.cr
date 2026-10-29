@@ -550,47 +550,24 @@ class Agent
   end
 
   # Trim history to respect max_history config, applied only after a
-  # complete user—>assistant turn (not during intermediate tool-call steps).
+  # complete user->assistant turn (not during intermediate tool-call steps).
   #
-  # Trims in **turn units** so that tool messages are never orphaned:
-  # a "turn" is a user message followed by zero or more assistant + tool
-  # messages that belong to it. We drop complete turns from the front
-  # until the number of user+assistant messages is at most max*2.
+  # A turn is a user message and everything up to the next user message:
+  # the assistant's reply, and with tools, its tool-call messages and their
+  # results. The oldest turns are dropped whole until at most `max_history`
+  # remain, so the kept history always starts at a user message and no
+  # tool result is ever left without the assistant message that called it.
   private def trim_history! : Nil
     @history.replace do |h|
-      if (max = @config.max_history) && max > 0
-        # Count only User and Assistant messages (tool messages are auxiliary).
-        msg_count = h.count { |m| m.role == Role::User || m.role == Role::Assistant }
-        if msg_count > max * 2
-          # Walk forward to find how many messages to drop so that at most
-          # max*2 user+assistant messages remain. We track the index of the
-          # last message that would be dropped.
-          keep_count = msg_count - max * 2
-          kept = 0
-          drop_count = 0
+      max = @config.max_history
+      next h unless max && max > 0
 
-          h.each_with_index do |m, idx|
-            if kept >= keep_count
-              drop_count = idx
-              break
-            end
+      starts = [] of Int32
+      h.each_with_index { |m, idx| starts << idx if m.role == Role::User }
+      next h if starts.size <= max
 
-            if m.role == Role::User || m.role == Role::Assistant
-              kept += 1
-            end
-          end
-
-          if drop_count > 0
-            h[drop_count..]
-          else
-            h
-          end
-        else
-          h
-        end
-      else
-        h
-      end
+      first_kept = starts[starts.size - max]
+      h[first_kept..]
     end
   end
 
@@ -618,6 +595,7 @@ class Agent
           content: "Error parsing arguments for tool '#{tc.name}': invalid JSON",
           tool_call_id: tc.id,
           name: tc.name,
+          is_error: true,
         )
         next
       end
@@ -631,19 +609,23 @@ class Agent
             content: "Error validating arguments for tool '#{tc.name}': #{errors.join("; ")}",
             tool_call_id: tc.id,
             name: tc.name,
+            is_error: true,
           )
           next
         end
       end
 
       result_msg = @handlers.decorate(ToolCallContext.new(tc, response)) do |ctx|
+        failed = false
         result = if cb = entry[:callback]
                    begin
                      cb.call(args_hash)
                    rescue ex
+                     failed = true
                      "Error executing tool '#{ctx.tool_call.name}': #{ex.message}"
                    end
                  else
+                   failed = true
                    "Error executing tool '#{ctx.tool_call.name}': no callback registered"
                  end
 
@@ -652,6 +634,7 @@ class Agent
           content: result,
           tool_call_id: ctx.tool_call.id,
           name: ctx.tool_call.name,
+          is_error: failed ? true : nil,
         )
       end
 

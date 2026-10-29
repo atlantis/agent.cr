@@ -316,8 +316,21 @@ class Agent
     getter prompt_tokens : Int32?
     getter completion_tokens : Int32?
     getter total_tokens : Int32?
+    # Prompt tokens served from the provider's prompt cache (OpenAI
+    # `prompt_tokens_details.cached_tokens`, Anthropic `cache_read_input_tokens`).
+    # Part of `prompt_tokens`, not in addition to it.
+    getter cached_tokens : Int32?
+    # Prompt tokens written to the cache on this request (Anthropic
+    # `cache_creation_input_tokens`); nil for providers that don't report it.
+    getter cache_creation_tokens : Int32?
 
-    def initialize(@prompt_tokens = nil, @completion_tokens = nil, @total_tokens = nil)
+    def initialize(
+      @prompt_tokens = nil,
+      @completion_tokens = nil,
+      @total_tokens = nil,
+      @cached_tokens = nil,
+      @cache_creation_tokens = nil,
+    )
     end
 
     # Nil-safe addition: sums each field over both usages. A field is nil in
@@ -329,6 +342,8 @@ class Agent
         add(prompt_tokens, other.prompt_tokens),
         add(completion_tokens, other.completion_tokens),
         add(total_tokens, other.total_tokens),
+        add(cached_tokens, other.cached_tokens),
+        add(cache_creation_tokens, other.cache_creation_tokens),
       )
     end
 
@@ -354,6 +369,18 @@ class Agent
     getter tool_call_id : String?
     getter name : String?
     getter reasoning : String?
+    # For tool-result messages: whether the result is an error (the tool
+    # raised, or its arguments were rejected). The OpenAI wire format has no
+    # such flag, so the OpenAI provider ignores it; providers whose format
+    # has one (e.g. `is_error` on an Anthropic `tool_result` block) send it.
+    @[JSON::Field(key: "is_error")]
+    getter is_error : Bool?
+    # Provider-specific data a custom provider needs to replay the message
+    # exactly as it came (signed reasoning blocks, citations, ...). Opaque to
+    # the agent loop: kept through `dump`/`load` and `history`, never sent by
+    # the OpenAI provider.
+    @[JSON::Field(key: "provider_data")]
+    getter provider_data : JSON::Any?
 
     def initialize(
       @role : Role,
@@ -363,6 +390,8 @@ class Agent
       @tool_call_id : String? = nil,
       @name : String? = nil,
       @reasoning : String? = nil,
+      @is_error : Bool? = nil,
+      @provider_data : JSON::Any? = nil,
     )
     end
 
@@ -377,18 +406,26 @@ class Agent
     end
 
     # Create an assistant message.
-    def self.assistant(content : String? = nil, tool_calls : Array(ToolCall)? = nil, reasoning : String? = nil) : self
-      new(role: Role::Assistant, content: content, tool_calls: tool_calls, reasoning: reasoning)
+    def self.assistant(content : String? = nil, tool_calls : Array(ToolCall)? = nil, reasoning : String? = nil, provider_data : JSON::Any? = nil) : self
+      new(role: Role::Assistant, content: content, tool_calls: tool_calls, reasoning: reasoning, provider_data: provider_data)
     end
 
     # Create a tool-result message from a completed tool call.
     # Convenient shorthand for building manual-dispatch results.
+    # Pass `is_error: true` when the tool failed, so a provider that can
+    # mark errors on the wire does.
     #
     # ```
     # msg = Agent::Message.tool_result(tc, "The weather is 22°C and sunny")
+    # msg = Agent::Message.tool_result(tc, "no such city", is_error: true)
     # ```
-    def self.tool_result(tool_call : ToolCall, content : String) : self
-      new(role: Role::Tool, content: content, tool_call_id: tool_call.id, name: tool_call.name)
+    def self.tool_result(tool_call : ToolCall, content : String, is_error : Bool? = nil) : self
+      new(role: Role::Tool, content: content, tool_call_id: tool_call.id, name: tool_call.name, is_error: is_error)
+    end
+
+    # Whether this is a tool result that reports an error.
+    def error? : Bool
+      @is_error == true
     end
 
     def has_tool_calls? : Bool
@@ -400,7 +437,8 @@ class Agent
       @role == other.role && @content == other.content &&
         @content_parts == other.content_parts &&
         @tool_call_id == other.tool_call_id && @name == other.name &&
-        @tool_calls == other.tool_calls && @reasoning == other.reasoning
+        @tool_calls == other.tool_calls && @reasoning == other.reasoning &&
+        @is_error == other.is_error && @provider_data == other.provider_data
     end
 
     def ==(other) : Bool

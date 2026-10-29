@@ -128,6 +128,17 @@ describe Agent::Usage do
     u.total_tokens.should eq(30)
   end
 
+  it "carries and sums the cache counts" do
+    a = Agent::Usage.new(prompt_tokens: 10, completion_tokens: 5, total_tokens: 15, cached_tokens: 8, cache_creation_tokens: 2)
+    b = Agent::Usage.new(prompt_tokens: 20, completion_tokens: 8, total_tokens: 28, cached_tokens: 20)
+    sum = a + b
+
+    sum.cached_tokens.should eq(28)
+    sum.cache_creation_tokens.should eq(2)
+    (Agent::Usage.new + Agent::Usage.new).cached_tokens.should be_nil
+    Agent::Usage.from_json(a.to_json).cached_tokens.should eq(8)
+  end
+
   it "sums every field with nil-safe +" do
     a = Agent::Usage.new(prompt_tokens: 10, completion_tokens: 5, total_tokens: 15)
     b = Agent::Usage.new(prompt_tokens: 20, completion_tokens: 8, total_tokens: 28)
@@ -156,5 +167,30 @@ describe Agent::Usage do
     empty.prompt_tokens.should be_nil
     empty.completion_tokens.should be_nil
     empty.total_tokens.should be_nil
+  end
+end
+
+describe Agent::Message do
+  it "marks a tool result as an error" do
+    tc = Agent::ToolCall.new("call_1", "fn", "{}")
+    ok = Agent::Message.tool_result(tc, "22°C")
+    ok.is_error.should be_nil
+    ok.error?.should be_false
+
+    failed = Agent::Message.tool_result(tc, "no such city", is_error: true)
+    failed.error?.should be_true
+    Agent::Message.from_json(failed.to_json).error?.should be_true
+    # the OpenAI wire format has no such field
+    failed.to_request_body.has_key?("is_error").should be_false
+  end
+
+  it "keeps provider data through JSON and out of the request body" do
+    data = JSON.parse(%({"blocks":[{"type":"thinking","signature":"abc"}]}))
+    msg = Agent::Message.assistant("hi", provider_data: data)
+    back = Agent::Message.from_json(msg.to_json)
+    back.provider_data.should eq(data)
+    back.should eq(msg)
+    msg.to_request_body.has_key?("provider_data").should be_false
+    Agent::Message.assistant("hi").should_not eq(msg)
   end
 end

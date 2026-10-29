@@ -2,6 +2,37 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- History trimming drops whole turns. A turn is a user message and
+  everything up to the next one, so `max_history` now counts conversation
+  turns as documented, the kept history always starts at a user message,
+  and a tool result is never left without the assistant message that called
+  it (previously a tool-call turn could be cut in the middle, and the next
+  request rejected by the API).
+- Streamed completions report token counts: the OpenAI provider sends
+  `stream_options: {include_usage: true}`, without which OpenAI, Ollama,
+  vLLM and others return no `usage` on a stream and `Response#metadata` was
+  all nil. `Agent::Config.new(include_usage: false)` turns it off for a
+  server that rejects the field.
+
+### Added
+
+- `Usage#cached_tokens` and `Usage#cache_creation_tokens`: the prompt
+  tokens served from the provider's prompt cache and written to it. The
+  OpenAI parser fills `cached_tokens` from `prompt_tokens_details`; both
+  sum with `+` like the other fields.
+- `Message#is_error` on tool results (`Message.tool_result(tc, text,
+  is_error: true)`, `Message#error?`). The agent loop sets it on the
+  results it builds for a tool that raised, had no callback, or whose
+  arguments failed to parse or validate. The OpenAI wire format has no such
+  flag and ignores it; a custom provider whose format does (Anthropic's
+  `tool_result` block) can send it.
+- `Message#provider_data : JSON::Any?`: an opaque slot for what a custom
+  provider needs to replay a message exactly (signed reasoning blocks,
+  citations). Kept through `dump`/`load`, compared by `==`, never sent by
+  the OpenAI provider.
+
 ## [0.2.0] - 2026-10-19
 
 ### Fixed

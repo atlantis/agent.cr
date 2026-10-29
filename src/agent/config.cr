@@ -17,6 +17,10 @@ class Agent
     # Explicit prompt cache key. If nil, Agent auto-generates one as
     # "agent-cr:<16-char-hex>" from its own session_id.
     getter prompt_cache_key : String?
+    # Ask the provider for token counts on streamed completions
+    # (`stream_options: {include_usage: true}` for OpenAI-compatible APIs).
+    # On by default; off for a server that rejects the field.
+    getter? include_usage : Bool
 
     # --- Per-read SSE timeout knobs ---
     # See AGENTS.md "dynamic read-timeout to fail-fast on hung SSE connections".
@@ -56,6 +60,7 @@ class Agent
       @extra_headers : Hash(String, String)? = nil,
       @max_tool_iterations : Int32? = 100,
       @prompt_cache_key : String? = nil,
+      @include_usage : Bool = true,
       *,
       first_byte_timeout_min : Time::Span | Int32 = 60,
       first_byte_timeout_max : Time::Span | Int32 = 300,

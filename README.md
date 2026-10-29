@@ -112,7 +112,7 @@ agent.reset
 
 ### History trimming
 
-Set `max_history` to limit the number of conversation turns kept in memory. The agent trims complete turn units (never orphaning tool messages).
+Set `max_history` to limit the number of conversation turns kept in memory. A turn is a user message and everything up to the next one (the assistant's reply, and with tools, its tool calls and their results); the oldest turns are dropped whole, so the kept history always starts at a user message and no tool result is ever orphaned.
 
 ```crystal
 config = Agent::Config.new(
@@ -261,6 +261,7 @@ while msg.has_tool_calls?
     when "get_weather"
       result = fetch_weather(args["city"].to_s)
       Agent::Message.tool_result(tc, result)
+      # or, when the tool failed: tool_result(tc, "...", is_error: true)
     else
       Agent::Message.tool_result(tc, "Unknown tool: #{tc.name}")
     end
@@ -423,7 +424,7 @@ agent = Agent.new(config, provider: MyProvider.new(...))
 |---|---|
 | `.stream { \|chunk\| }` | Yield each delta as it arrives from the API |
 | `.message` | Block until the final `Message` is ready, then return it |
-| `.metadata` | Block until `Usage` (token counts) is ready, then return it. With `auto_execute_tools`, the counts of every tool-loop iteration are summed, so this is the whole turn's usage |
+| `.metadata` | Block until `Usage` (token counts) is ready, then return it. With `auto_execute_tools`, the counts of every tool-loop iteration are summed, so this is the whole turn's usage. `cached_tokens` and `cache_creation_tokens` say how much of the prompt the provider's cache served or stored, when it reports that |
 | `.join` | Block until both message and metadata are ready |
 | `.finished?` | Poll whether the response is complete |
 | `.error?` | Whether the response represents a failed request |
@@ -443,6 +444,8 @@ msg.tool_calls     # Array(ToolCall)? — function calls from the model
 msg.tool_call_id   # String? — id for tool result messages
 msg.content_parts  # Array(ContentPart)? — multimodal parts (text + images)
 msg.has_tool_calls? # Bool — convenience check
+msg.is_error       # Bool? — on a tool result: the tool failed (set by the loop for its own errors)
+msg.provider_data  # JSON::Any? — opaque data a custom provider keeps to replay the message
 ```
 
 ---
@@ -464,6 +467,7 @@ Agent::Config.new(
   extra_headers:      Hash(String, String)?, # optional extra HTTP headers
   max_tool_iterations: Int32?,             # default: 100 — safety limit for tool loops
   prompt_cache_key:   String?,             # optional explicit prompt cache key
+  include_usage:      Bool,                # default: true — ask for token counts on streamed completions
   *,
   # Per-read SSE timeouts (fail-fast on hung connections):
   first_byte_timeout_min:          Time::Span | Int32 = 60,  # TTFT floor (seconds or span)

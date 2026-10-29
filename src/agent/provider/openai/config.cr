@@ -20,6 +20,12 @@ class Agent
         getter connect_timeout : Time::Span?
         getter extra_headers : Hash(String, String)?
         getter prompt_cache_key : String?
+        # Ask for a `usage` object on the stream's last chunk
+        # (`stream_options: {include_usage: true}`). Without it OpenAI,
+        # Ollama, vLLM and others report no token counts on streamed
+        # completions. On by default; turn it off for a server that rejects
+        # the field.
+        getter? include_usage : Bool
 
         # Cached parsed URI — computed once at construction.
         getter parsed_uri : URI
@@ -35,6 +41,7 @@ class Agent
           connect_timeout : Time::Span | Int32? = nil,
           @extra_headers : Hash(String, String)? = nil,
           @prompt_cache_key : String? = nil,
+          @include_usage : Bool = true,
         )
           validate_temperature(@temperature)
           validate_max_tokens(@max_tokens)
@@ -93,6 +100,7 @@ class Agent
           connect_timeout: config.connect_timeout,
           extra_headers: config.extra_headers,
           prompt_cache_key: config.prompt_cache_key,
+          include_usage: config.include_usage?,
         )
         @cache_key = cache_key
       end
@@ -116,6 +124,7 @@ class Agent
           @config.max_tokens,
           @config.temperature,
           @config.prompt_cache_key ? @cache_key : nil,
+          include_usage: @config.include_usage?,
         )
 
         headers = HTTP::Headers.new
