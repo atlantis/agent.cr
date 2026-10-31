@@ -26,6 +26,12 @@ class Agent
         # completions. On by default; turn it off for a server that rejects
         # the field.
         getter? include_usage : Bool
+        # See Agent::Config#reasoning_effort.
+        getter reasoning_effort : ReasoningEffort?
+        # Extra top-level body fields; see Agent::Config#extra_body.
+        getter extra_body : Hash(String, JSON::Any)?
+        # See Agent::Config#replay_reasoning?.
+        getter? replay_reasoning : Bool
 
         # Cached parsed URI — computed once at construction.
         getter parsed_uri : URI
@@ -42,6 +48,9 @@ class Agent
           @extra_headers : Hash(String, String)? = nil,
           @prompt_cache_key : String? = nil,
           @include_usage : Bool = true,
+          @reasoning_effort : ReasoningEffort? = nil,
+          @extra_body : Hash(String, JSON::Any)? = nil,
+          @replay_reasoning : Bool = true,
         )
           validate_temperature(@temperature)
           validate_max_tokens(@max_tokens)
@@ -55,6 +64,18 @@ class Agent
           unless @parsed_uri.scheme && @parsed_uri.host
             raise ArgumentError.new("api_endpoint must be a valid URL, got #{@api_endpoint}")
           end
+        end
+
+        # Identifies the endpoint in the replay data this provider stores:
+        # signed and encrypted blocks are only valid where they came from.
+        def replay_endpoint : String
+          @api_endpoint.rstrip('/')
+        end
+
+        # OpenRouter takes effort as `reasoning: {effort: ...}`; OpenAI and
+        # servers that follow it take `reasoning_effort`.
+        def openrouter? : Bool
+          @parsed_uri.host.try(&.ends_with?("openrouter.ai")) || false
         end
 
         # The chat completions path derived from api_endpoint.
@@ -83,6 +104,26 @@ class Agent
         end
       end
 
+      # Key of this provider's entry in `Message#provider_data` and
+      # `ToolCall#provider_data`.
+      DATA_KEY = "openai"
+
+      # Replay data for a message or tool call, under DATA_KEY with the
+      # endpoint and model that produced it.
+      def self.replay_data(endpoint : String?, model : String?, entries : Hash(String, JSON::Any)) : JSON::Any
+        scope = {"endpoint" => JSON::Any.new(endpoint), "model" => JSON::Any.new(model)}
+        JSON::Any.new({DATA_KEY => JSON::Any.new(scope.merge(entries))})
+      end
+
+      # What this provider stored, if it came from the same endpoint and
+      # model: signed and encrypted blocks are refused anywhere else, and one
+      # endpoint (OpenRouter) serves many models.
+      def self.replay_entries(data : JSON::Any?, endpoint : String?, model : String?) : Hash(String, JSON::Any)?
+        ours = data.try(&.as_h?).try(&.[DATA_KEY]?).try(&.as_h?) || return
+        return unless ours["endpoint"]?.try(&.as_s?) == endpoint && ours["model"]?.try(&.as_s?) == model
+        ours
+      end
+
       # --- Provider::Base implementation ---
 
       @config : Config
@@ -101,6 +142,9 @@ class Agent
           extra_headers: config.extra_headers,
           prompt_cache_key: config.prompt_cache_key,
           include_usage: config.include_usage?,
+          reasoning_effort: config.reasoning_effort,
+          extra_body: config.extra_body,
+          replay_reasoning: config.replay_reasoning?,
         )
         @cache_key = cache_key
       end
@@ -117,6 +161,10 @@ class Agent
 
       # Build an HTTP request for the OpenAI chat completions API.
       def build_request(messages : Array(Message), tools : Array(Tool)?) : NamedTuple(path: String, headers: HTTP::Headers, body: String)
+        build_request(messages, tools, RequestOptions.new)
+      end
+
+      def build_request(messages : Array(Message), tools : Array(Tool)?, options : RequestOptions) : NamedTuple(path: String, headers: HTTP::Headers, body: String)
         body_hash = RequestBody.build(
           messages,
           tools,
@@ -125,6 +173,11 @@ class Agent
           @config.temperature,
           @config.prompt_cache_key ? @cache_key : nil,
           include_usage: @config.include_usage?,
+          reasoning_effort: options.reasoning_effort || @config.reasoning_effort,
+          openrouter: @config.openrouter?,
+          extra_body: @config.extra_body,
+          endpoint: @config.replay_endpoint,
+          replay: @config.replay_reasoning?,
         )
 
         headers = HTTP::Headers.new
@@ -151,7 +204,9 @@ class Agent
       ) : {Message, Usage, String?}
         StreamParser.parse(io, response, cancel,
           first_byte_timeout: first_byte_timeout,
-          idle_timeout: idle_timeout)
+          idle_timeout: idle_timeout,
+          endpoint: @config.replay_endpoint,
+          model: @config.model)
       end
 
       # Release any provider-owned resources (no-op for OpenAI).

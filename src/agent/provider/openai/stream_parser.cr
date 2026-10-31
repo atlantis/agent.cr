@@ -6,12 +6,23 @@ class Agent
       private class ToolCallDelta
         property id : String
         property name : String
-        property arguments : String
+        # The call's `extra_content` (Gemini's thought signature).
+        property extra_content : JSON::Any?
+        # Appended in place: re-concatenating a String per fragment is
+        # quadratic for long arguments.
+        @arguments = IO::Memory.new
 
         def initialize
           @id = ""
           @name = ""
-          @arguments = ""
+        end
+
+        def arguments : String
+          @arguments.to_s
+        end
+
+        def append_arguments(fragment : String) : Nil
+          @arguments << fragment
         end
       end
 
@@ -139,6 +150,73 @@ class Agent
         end
       end
 
+      # Reasoning state across a stream besides its text: the
+      # `reasoning_details` blocks (OpenRouter), and the field the text came
+      # in, which decides how it is sent back.
+      #
+      # A block fragment continues the previous block when both carry the
+      # same type and `index` (or the same `id`): its text, summary and data
+      # are appended, and its other fields (signature, format) fill in or
+      # replace. Anything else starts a new block, so the block order the
+      # provider sent is kept.
+      private class ReasoningAccumulator
+        TEXT_KEYS = {"text", "summary", "data"}
+
+        # "reasoning_content", "reasoning", "thinking", "content_thinking"
+        # (Mistral's thinking chunks) or "reasoning_details".
+        property field : String?
+
+        @blocks = [] of Hash(String, JSON::Any)
+        # Text fields of the last block, appended in place: re-concatenating
+        # a String per fragment is quadratic for long reasoning.
+        @open = {} of String => String::Builder
+
+        def add_detail(item : Hash(String, JSON::Any)) : Nil
+          last = @blocks.last?
+          if last && continues?(last, item)
+            item.each do |k, v|
+              if k.in?(TEXT_KEYS) && (s = v.as_s?)
+                (@open[k] ||= String::Builder.new) << s
+              elsif !v.raw.nil?
+                last[k] = v
+              end
+            end
+          else
+            close_block
+            block = {} of String => JSON::Any
+            item.each do |k, v|
+              if k.in?(TEXT_KEYS) && (s = v.as_s?)
+                (@open[k] = String::Builder.new) << s
+              else
+                block[k] = v
+              end
+            end
+            @blocks << block
+          end
+        end
+
+        def details : Array(Hash(String, JSON::Any))
+          close_block
+          @blocks
+        end
+
+        private def close_block : Nil
+          if last = @blocks.last?
+            @open.each { |k, b| last[k] = JSON::Any.new(b.to_s) }
+          end
+          @open.clear
+        end
+
+        private def continues?(last : Hash(String, JSON::Any), item : Hash(String, JSON::Any)) : Bool
+          return false unless last["type"]? == item["type"]?
+          if (id = item["id"]?.try(&.as_s?)) && (last_id = last["id"]?.try(&.as_s?))
+            return id == last_id
+          end
+          index = item["index"]?.try(&.as_i?)
+          !index.nil? && index == last["index"]?.try(&.as_i?)
+        end
+      end
+
       # Parses an OpenAI SSE streaming response.
       module StreamParser
         extend self
@@ -150,10 +228,13 @@ class Agent
           *,
           first_byte_timeout : Time::Span? = nil,
           idle_timeout : Time::Span? = nil,
+          endpoint : String? = nil,
+          model : String? = nil,
         ) : {Message, Usage, String?}
           tool_calls = ToolCallAccumulator.new
           content_buffer = String::Builder.new
           reasoning_buffer = String::Builder.new
+          reasoning = ReasoningAccumulator.new
           usage = Usage.new
           finish_reason = nil
           done = false
@@ -205,6 +286,7 @@ class Agent
               response,
               content_buffer,
               reasoning_buffer,
+              reasoning,
               tool_calls,
               usage,
               finish_reason,
@@ -212,7 +294,7 @@ class Agent
           end
 
           check_finished(finish_reason, done, cancel)
-          final_message = build_final_message(content_buffer, reasoning_buffer, tool_calls.deltas)
+          final_message = build_final_message(content_buffer, reasoning_buffer, reasoning, tool_calls.deltas, endpoint, model)
           {final_message, usage, finish_reason}
         end
 
@@ -227,6 +309,7 @@ class Agent
           response : Response,
           content_buffer : String::Builder,
           reasoning_buffer : String::Builder,
+          reasoning : ReasoningAccumulator,
           tool_calls : ToolCallAccumulator,
           usage : Usage,
           finish_reason : String?,
@@ -249,7 +332,7 @@ class Agent
 
           raise_stream_error(parsed)
           new_usage = parse_usage(parsed, usage)
-          new_finish = process_deltas(parsed, response, content_buffer, reasoning_buffer, tool_calls) || finish_reason
+          new_finish = process_deltas(parsed, response, content_buffer, reasoning_buffer, reasoning, tool_calls) || finish_reason
           {new_usage, new_finish}
         end
 
@@ -307,11 +390,13 @@ class Agent
           if usage_data = parsed["usage"]?
             if u = usage_data.as_h?
               cached = u["prompt_tokens_details"]?.try(&.as_h?).try(&.["cached_tokens"]?).try(&.as_i?)
+              reasoning = u["completion_tokens_details"]?.try(&.as_h?).try(&.["reasoning_tokens"]?).try(&.as_i?)
               return Usage.new(
                 prompt_tokens: u["prompt_tokens"]?.try(&.as_i?),
                 completion_tokens: u["completion_tokens"]?.try(&.as_i?),
                 total_tokens: u["total_tokens"]?.try(&.as_i?),
                 cached_tokens: cached,
+                reasoning_tokens: reasoning,
               )
             end
           elsif timings = parsed["timings"]?
@@ -333,6 +418,7 @@ class Agent
           response : Response,
           content_buffer : String::Builder,
           reasoning_buffer : String::Builder,
+          reasoning : ReasoningAccumulator,
           tool_calls : ToolCallAccumulator,
         ) : String?
           finish_reason = nil
@@ -345,14 +431,27 @@ class Agent
               finish_reason = reason
             end
 
-            if c = delta["content"]?.try(&.as_s?)
-              content_buffer << c
-              response.push_chunk(Response::Chunk.new(c, Response::ChunkKind::Content))
+            text, thinking = content_delta(delta)
+            # Mistral sends its thinking ahead of the answer in one delta.
+            if thinking
+              reasoning.field ||= "content_thinking"
+              reasoning_buffer << thinking
+              response.push_chunk(Response::Chunk.new(thinking, Response::ChunkKind::Reasoning))
+            end
+            if text
+              content_buffer << text
+              response.push_chunk(Response::Chunk.new(text, Response::ChunkKind::Content))
             end
 
-            if rc = reasoning_delta_text(delta)
+            if found = reasoning_delta_text(delta)
+              rc, field = found
+              reasoning.field ||= field
               reasoning_buffer << rc
               response.push_chunk(Response::Chunk.new(rc, Response::ChunkKind::Reasoning))
+            end
+
+            delta["reasoning_details"]?.try(&.as_a?).try &.each do |item|
+              item.as_h?.try { |h| reasoning.add_detail(h) }
             end
 
             process_tool_call_deltas(delta, tool_calls, response)
@@ -370,10 +469,10 @@ class Agent
         # Order: `reasoning_content` (DeepSeek native / vLLM) -> `reasoning`
         # (OpenRouter, Gemini-compat) -> `thinking` (Anthropic-via-proxy) ->
         # `reasoning_details[].text` (OpenAI Responses / OpenRouter structured).
-        private def reasoning_delta_text(delta : Hash(String, JSON::Any)) : String?
+        private def reasoning_delta_text(delta : Hash(String, JSON::Any)) : {String, String}?
           {"reasoning_content", "reasoning", "thinking"}.each do |key|
-            if text = delta[key]?.try(&.as_s?)
-              return text
+            if (text = delta[key]?.try(&.as_s?)) && !text.empty?
+              return {text, key}
             end
           end
 
@@ -389,10 +488,53 @@ class Agent
               end
             end
             s = joined.to_s
-            return s unless s.empty?
+            return {s, "reasoning_details"} unless s.empty?
           end
 
           nil
+        end
+
+        # Reasoning text arriving in these fields is sent back in the same
+        # shape: DeepSeek rejects a tool request without it, and Kimi and
+        # Mistral ask for it. Other fields are display-only (OpenRouter's
+        # `reasoning` repeats `reasoning_details`, which is sent instead).
+        REPLAYED_FIELDS = {"reasoning_content", "content_thinking"}
+
+        private def replay_entries(reasoning : ReasoningAccumulator, text : String, endpoint : String?, model : String?) : JSON::Any?
+          entries = {} of String => JSON::Any
+          details = reasoning.details
+          entries["reasoning_details"] = JSON::Any.new(details.map { |b| JSON::Any.new(b) }) unless details.empty?
+          if (field = reasoning.field) && field.in?(REPLAYED_FIELDS) && !text.empty?
+            entries["reasoning_field"] = JSON::Any.new(field)
+          end
+          OpenAI.replay_data(endpoint, model, entries) unless entries.empty?
+        end
+
+        # The answer text and thinking text of a delta's `content`: a string,
+        # or (Mistral) a list of `text` chunks and `thinking` chunks, each
+        # holding a list of text chunks.
+        private def content_delta(delta : Hash(String, JSON::Any)) : {String?, String?}
+          content = delta["content"]? || return {nil, nil}
+          if s = content.as_s?
+            return {s.empty? ? nil : s, nil}
+          end
+          parts = content.as_a? || return {nil, nil}
+
+          text = String::Builder.new
+          thinking = String::Builder.new
+          parts.each do |part|
+            h = part.as_h? || next
+            case h["type"]?.try(&.as_s?)
+            when "text"
+              h["text"]?.try(&.as_s?).try { |t| text << t }
+            when "thinking"
+              h["thinking"]?.try(&.as_a?).try &.each do |inner|
+                inner.as_h?.try(&.["text"]?).try(&.as_s?).try { |t| thinking << t }
+              end
+            end
+          end
+          answer, thought = text.to_s, thinking.to_s
+          {answer.empty? ? nil : answer, thought.empty? ? nil : thought}
         end
 
         private def process_tool_call_deltas(
@@ -408,6 +550,9 @@ class Agent
             entry = tool_calls.route(tcd)
             update_tool_call_id(entry, tcd)
             update_tool_call_function(entry, tcd, response)
+            if (extra = tcd["extra_content"]?) && !extra.raw.nil?
+              entry.extra_content = extra
+            end
           end
         end
 
@@ -434,7 +579,7 @@ class Agent
 
           if fn_h_args = fn_h["arguments"]?
             if args_str = fn_h_args.as_s?
-              entry.arguments += args_str
+              entry.append_arguments(args_str)
               response.push_chunk(Response::Chunk.new(args_str, Response::ChunkKind::ToolCallArgs))
             end
           end
@@ -443,7 +588,10 @@ class Agent
         private def build_final_message(
           content_buffer : String::Builder,
           reasoning_buffer : String::Builder,
+          reasoning : ReasoningAccumulator,
           tool_call_deltas : Hash(Int32, ToolCallDelta),
+          endpoint : String?,
+          model : String?,
         ) : Message
           full_content = content_buffer.to_s
           reasoning_content = reasoning_buffer.to_s
@@ -452,7 +600,8 @@ class Agent
                          nil
                        else
                          tool_call_deltas.map do |_idx, delta|
-                           ToolCall.new(id: delta.id, name: delta.name, arguments: delta.arguments)
+                           extra = delta.extra_content.try { |e| OpenAI.replay_data(endpoint, model, {"extra_content" => e}) }
+                           ToolCall.new(id: delta.id, name: delta.name, arguments: delta.arguments, provider_data: extra)
                          end
                        end
 
@@ -464,6 +613,7 @@ class Agent
             content: content,
             tool_calls: tool_calls,
             reasoning: reasoning_content.empty? ? nil : reasoning_content,
+            provider_data: replay_entries(reasoning, reasoning_content, endpoint, model),
           )
         end
       end

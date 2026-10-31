@@ -13,10 +13,16 @@ class Agent
           temperature : Float64?,
           cache_key : String?,
           include_usage : Bool = true,
+          reasoning_effort : ReasoningEffort? = nil,
+          extra_body : Hash(String, JSON::Any)? = nil,
+          *,
+          openrouter : Bool = false,
+          endpoint : String? = nil,
+          replay : Bool = true,
         ) : Hash(String, JSON::Any)
           body = {
             "model"    => JSON::Any.new(model),
-            "messages" => JSON::Any.new(messages.map { |m| message_to_request_body(m) }.map { |h| JSON::Any.new(h) }),
+            "messages" => JSON::Any.new(messages.map { |m| message_to_request_body(m, replay ? {endpoint, model} : nil) }.map { |h| JSON::Any.new(h) }),
             "stream"   => JSON::Any.new(true),
           }
 
@@ -38,6 +44,14 @@ class Agent
             body["temperature"] = JSON::Any.new(t)
           end
 
+          if effort = reasoning_effort
+            if openrouter
+              body["reasoning"] = JSON::Any.new({"effort" => JSON::Any.new(OPENROUTER_EFFORT[effort])})
+            else
+              body["reasoning_effort"] = JSON::Any.new(OPENAI_EFFORT[effort])
+            end
+          end
+
           if ts = tools
             body["tools"] = JSON::Any.new(ts.map do |tool_def|
               fd = tool_def.function
@@ -52,11 +66,63 @@ class Agent
             end)
           end
 
+          extra_body.try &.each { |k, v| body[k] = v unless body.has_key?(k) }
+
           body
         end
 
+        # OpenAI has no "max"; its highest is "xhigh". "none" turns reasoning
+        # off on models that allow it.
+        OPENAI_EFFORT = {
+          ReasoningEffort::Off     => "none",
+          ReasoningEffort::Minimal => "minimal",
+          ReasoningEffort::Low     => "low",
+          ReasoningEffort::Medium  => "medium",
+          ReasoningEffort::High    => "high",
+          ReasoningEffort::Xhigh   => "xhigh",
+          ReasoningEffort::Max     => "xhigh",
+        }
+
+        OPENROUTER_EFFORT = {
+          ReasoningEffort::Off     => "none",
+          ReasoningEffort::Minimal => "minimal",
+          ReasoningEffort::Low     => "low",
+          ReasoningEffort::Medium  => "medium",
+          ReasoningEffort::High    => "high",
+          ReasoningEffort::Xhigh   => "xhigh",
+          ReasoningEffort::Max     => "max",
+        }
+
+        # Sends back the reasoning an assistant message came with, in the
+        # shape its endpoint returned it, so the model keeps its reasoning
+        # across a tool loop:
+        # - `reasoning_details` blocks (OpenRouter), encrypted and signed
+        #   ones included, unchanged and in order;
+        # - `reasoning_content` text (DeepSeek, Kimi, vLLM);
+        # - Mistral's thinking chunk ahead of the answer in `content`.
+        private def replay_reasoning(body : Hash(String, JSON::Any), msg : Message, ours : Hash(String, JSON::Any)) : Nil
+          if details = ours["reasoning_details"]?
+            body["reasoning_details"] = details
+          end
+          text = msg.reasoning.presence || return
+
+          case ours["reasoning_field"]?.try(&.as_s?)
+          when "reasoning_content"
+            body["reasoning_content"] = JSON::Any.new(text)
+          when "content_thinking"
+            thinking = {"type" => JSON::Any.new("text"), "text" => JSON::Any.new(text)}
+            parts = [JSON::Any.new({"type" => JSON::Any.new("thinking"), "thinking" => JSON::Any.new([JSON::Any.new(thinking)])})]
+            if answer = msg.content.presence
+              parts << JSON::Any.new({"type" => JSON::Any.new("text"), "text" => JSON::Any.new(answer)})
+            end
+            body["content"] = JSON::Any.new(parts)
+          end
+        end
+
         # Build the OpenAI wire-format hash for a single Message.
-        private def message_to_request_body(msg : Message) : Hash(String, JSON::Any)
+        # `scope` is the {endpoint, model} whose reasoning is sent back, or
+        # nil to send none.
+        private def message_to_request_body(msg : Message, scope : {String?, String}?) : Hash(String, JSON::Any)
           body = {"role" => JSON::Any.new(msg.role.to_s)}
 
           # Build content
@@ -75,15 +141,25 @@ class Agent
 
           if tcs = msg.tool_calls
             body["tool_calls"] = JSON::Any.new(tcs.map do |tc|
-              JSON::Any.new({
+              call = {
                 "id"       => JSON::Any.new(tc.id),
                 "type"     => JSON::Any.new("function"),
                 "function" => JSON::Any.new({
                   "name"      => JSON::Any.new(tc.name),
                   "arguments" => JSON::Any.new(tc.arguments),
                 }),
-              })
+              }
+              if extra = scope.try { |(e, m)| OpenAI.replay_entries(tc.provider_data, e, m) }.try(&.["extra_content"]?)
+                call["extra_content"] = extra
+              end
+              JSON::Any.new(call)
             end)
+          end
+
+          if msg.role == Role::Assistant
+            if ours = scope.try { |(e, m)| OpenAI.replay_entries(msg.provider_data, e, m) }
+              replay_reasoning(body, msg, ours)
+            end
           end
 
           body

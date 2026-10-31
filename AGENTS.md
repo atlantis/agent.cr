@@ -16,6 +16,7 @@ src/
   agent/
     version.cr           # VERSION constant
     config.cr            # Agent::Config — generic fields (system_prompt, max_history, timeouts)
+    request_options.cr   # Agent::ReasoningEffort, Agent::RequestOptions (per-#ask overrides)
     error.cr             # Agent::Error hierarchy
     json_converter.cr    # JSONConverter helper for tool param schemas
     message.cr           # Agent::Message, ContentPart, ToolCall, Usage
@@ -35,6 +36,15 @@ src/
 ### Provider separation
 
 All wire-format concerns live in `Provider::Base` implementations. The default `Provider::OpenAI` handles the OpenAI /v1/chat/completions format. The `Agent` core talks only to the abstract interface.
+
+`Message#provider_data` and `ToolCall#provider_data` hold what a provider
+needs to replay a message exactly (signed or encrypted reasoning, Gemini
+thought signatures). Each provider writes under its own key and reads only
+that key; the OpenAI provider also records the endpoint and model and
+replays only to them. It replays reasoning in the field it arrived in, but
+only for fields providers require back (`reasoning_details`,
+`reasoning_content`, Mistral's thinking chunks); `reasoning` and `thinking`
+text is display-only, since OpenRouter's repeats its blocks.
 
 ## Architecture diagram
 

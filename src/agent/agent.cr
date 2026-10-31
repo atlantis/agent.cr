@@ -12,7 +12,10 @@ class Agent
   end
 
   # Internal request types sent to the processing fiber.
-  private record AskRequest, new_messages : Array(Message), tools : Array(Tool)?, response : Response
+  private record AskRequest, new_messages : Array(Message), tools : Array(Tool)?, response : Response, options : RequestOptions
+
+  # Version written by #dump; #load refuses a newer one.
+  DUMP_VERSION = 2
 
   private alias Request = AskRequest
 
@@ -167,8 +170,10 @@ class Agent
   # puts resp.message.content
   # ```
   #
+  # `reasoning_effort` overrides `Config#reasoning_effort` for this request.
+  #
   # Raises Agent::ClosedError if the agent has been closed via #close.
-  def ask(content : String, attachments : Array(String)? = nil, tools : Array(Tool)? = nil) : Response
+  def ask(content : String, attachments : Array(String)? = nil, tools : Array(Tool)? = nil, reasoning_effort : ReasoningEffort? = nil) : Response
     @state_mutex.synchronize { raise ClosedError.new if @closed }
 
     msg = if atts = attachments
@@ -179,7 +184,7 @@ class Agent
           end
 
     response = Response.new
-    @request_channel.send(AskRequest.new([msg], tools, response))
+    @request_channel.send(AskRequest.new([msg], tools, response, RequestOptions.new(reasoning_effort: reasoning_effort)))
     response
   rescue Channel::ClosedError
     raise ClosedError.new
@@ -189,11 +194,11 @@ class Agent
   # Used to feed tool call results back to the model after it requests them.
   #
   # Raises Agent::ClosedError if the agent has been closed via #close.
-  def ask(tool_results : Array(Message), tools : Array(Tool)? = nil) : Response
+  def ask(tool_results : Array(Message), tools : Array(Tool)? = nil, reasoning_effort : ReasoningEffort? = nil) : Response
     @state_mutex.synchronize { raise ClosedError.new if @closed }
 
     response = Response.new
-    @request_channel.send(AskRequest.new(tool_results, tools, response))
+    @request_channel.send(AskRequest.new(tool_results, tools, response, RequestOptions.new(reasoning_effort: reasoning_effort)))
     response
   rescue Channel::ClosedError
     raise ClosedError.new
@@ -223,6 +228,7 @@ class Agent
   # ```
   def load(data : String | JSON::Any) : Nil
     parsed = parse_session_data(data)
+    check_dump_version(parsed)
 
     id = parse_str_field(parsed, "session_id")
     key = parse_str_field(parsed, "cache_key")
@@ -262,6 +268,17 @@ class Agent
     parsed = h.as_h?
     raise SessionLoadError.new("not a valid JSON object") if parsed.nil?
     parsed
+  end
+
+  # A dump without a version predates versioning (version 1).
+  private def check_dump_version(parsed : Hash(String, JSON::Any)) : Nil
+    raw = parsed["version"]?
+    return if raw.nil?
+    version = raw.as_i?
+    raise SessionLoadError.new("'version' field is not an integer") if version.nil?
+    if version > DUMP_VERSION
+      raise SessionLoadError.new("version #{version} is newer than this agent-cr supports (#{DUMP_VERSION})")
+    end
   end
 
   private def parse_str_field(parsed : Hash(String, JSON::Any), field : String) : String
@@ -325,7 +342,7 @@ class Agent
   def dump(json : JSON::Builder) : Nil
     result = snapshot_session
 
-    json.field "version", 1
+    json.field "version", DUMP_VERSION
     json.field "session_id", result.session_id
     json.field "cache_key", result.cache_key
     json.field "history", result.history
@@ -465,7 +482,7 @@ class Agent
         response.chunk_handler = ->(chunk : Response::Chunk) {
           @handlers.decorate(ChunkContext.new(chunk), &.chunk)
         }
-        msg, usage, finish_reason = http_post_stream(messages, tools, response, total_usage)
+        msg, usage, finish_reason = http_post_stream(messages, tools, request.options, response, total_usage)
         total_usage = total_usage + usage
 
         # Cancellation is a user-initiated abort, not a failure: the partial
@@ -577,13 +594,11 @@ class Agent
   # appended to history so the next #ask has continuity (the user's question
   # was already appended at the start of #process_request_loop and is kept).
   # Tool calls are dropped: they never ran, and their arguments may be cut
-  # off mid-stream. The response is then finished with a CancelledError.
+  # off mid-stream. So is the provider's replay data: a reasoning block cut
+  # off before its signature would be refused when sent back. The response
+  # is then finished with a CancelledError.
   private def handle_cancellation(partial_msg : Message, response : Response, usage : Usage) : Nil
-    kept = if partial_msg.has_tool_calls?
-             Message.new(role: Role::Assistant, content: partial_msg.content, reasoning: partial_msg.reasoning)
-           else
-             partial_msg
-           end
+    kept = Message.new(role: Role::Assistant, content: partial_msg.content, reasoning: partial_msg.reasoning)
     @history.lock { |h| h << kept } unless kept.content.nil?
     trim_history!
     response.finish_with_error(CancelledError.new, usage)
@@ -859,12 +874,13 @@ class Agent
   private def http_post_stream(
     messages : Array(Message),
     tools : Array(Tool)?,
+    options : RequestOptions,
     response : Response,
     turn_usage : Usage,
   ) : {Message, Usage, String?}
-    @handlers.decorate(TurnContext.new(messages, tools)) do |ctx|
+    @handlers.decorate(TurnContext.new(messages, tools, options)) do |ctx|
       all_tools = combined_tools(ctx.tools)
-      req = @provider.build_request(ctx.messages, all_tools)
+      req = @provider.build_request(ctx.messages, all_tools, ctx.options)
       post_with_retries(req, response, turn_usage)
     end
   end

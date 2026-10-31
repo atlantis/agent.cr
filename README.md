@@ -89,6 +89,38 @@ resp.stream do |chunk|
 end
 ```
 
+### Reasoning models
+
+Reasoning streams as `ChunkKind::Reasoning` chunks and ends up in `message.reasoning`. Set how hard the model thinks with `reasoning_effort`. It's one setting for every provider; the OpenAI provider sends it as `reasoning_effort` (`:max` becomes `"xhigh"`, `:off` becomes `"none"`), or as OpenRouter's `reasoning: {effort: ...}` when the endpoint is openrouter.ai. Override it for one request on `ask`, or per provider call from a handler (`TurnContext#options`). For anything else the provider takes, use `extra_body`:
+
+```crystal
+agent = Agent.new(Agent::Config.new(model: "o4-mini", reasoning_effort: :medium))
+agent.ask("Plan the migration", reasoning_effort: :high)
+
+# A reasoning budget on OpenRouter
+Agent::Config.new(
+  api_endpoint: "https://openrouter.ai/api/v1",
+  model: "anthropic/claude-sonnet-4.5",
+  extra_body: {"reasoning" => JSON::Any.new({"max_tokens" => JSON::Any.new(4000_i64)})},
+)
+```
+
+Reasoning models in a tool loop need their earlier reasoning back on every request, and some refuse the request without it. So the agent keeps the reasoning in `provider_data` and sends it back on later requests in the shape the endpoint returned it:
+
+| Endpoint returned | Sent back as |
+|---|---|
+| `reasoning_details` blocks (OpenRouter), signed and encrypted ones included | the same blocks, unchanged and in order |
+| a tool call's `extra_content` (Gemini's thought signature) | the same `extra_content` on that call |
+| `reasoning_content` text (DeepSeek, which answers 400 without it; Kimi; vLLM) | `reasoning_content` |
+| thinking chunks in `content` (Mistral) | a thinking chunk ahead of the answer in `content` |
+| `reasoning` or `thinking` text (Groq, Ollama, OpenRouter's summary of its blocks) | nothing: display only |
+
+This works across `dump`/`load` too. The data is kept under the provider's own key, with the endpoint and model that produced it, and goes back only to that endpoint and model, since signed blocks are refused anywhere else. A cancelled reply keeps its text but not this data, since a block cut off before its signature would be refused. Set `replay_reasoning: false` for a server that rejects these fields.
+
+Not every model takes every effort level: OpenAI's `gpt-5` has `:minimal` but no `:off`, for example, and Gemini 3 can't turn reasoning off. An unsupported level is the provider's 400, so pick levels per model.
+
+`resp.metadata.reasoning_tokens` is how many completion tokens went on reasoning, when the provider reports it. They are already counted in `completion_tokens`.
+
 ---
 
 ## Conversation history
@@ -464,7 +496,7 @@ agent = Agent.new(config, provider: MyProvider.new(...))
 |---|---|
 | `.stream { \|chunk\| }` | Yield each delta as it arrives from the API |
 | `.message` | Block until the final `Message` is ready, then return it |
-| `.metadata` | Block until `Usage` (token counts) is ready, then return it. With `auto_execute_tools`, the counts of every tool-loop iteration are summed, so this is the whole turn's usage. `cached_tokens` and `cache_creation_tokens` say how much of the prompt the provider's cache served or stored, when it reports that |
+| `.metadata` | Block until `Usage` (token counts) is ready, then return it. With `auto_execute_tools`, the counts of every tool-loop iteration are summed, so this is the whole turn's usage. `cached_tokens` and `cache_creation_tokens` say how much of the prompt the provider's cache served or stored, and `reasoning_tokens` how much of the completion went on reasoning, when it reports that |
 | `.join` | Block until both message and metadata are ready |
 | `.finished?` | Poll whether the response is complete |
 | `.error?` | Whether the response represents a failed request |
@@ -485,7 +517,8 @@ msg.tool_call_id   # String? — id for tool result messages
 msg.content_parts  # Array(ContentPart)? — multimodal parts (text + images)
 msg.has_tool_calls? # Bool — convenience check
 msg.is_error       # Bool? — on a tool result: the tool failed (set by the loop for its own errors)
-msg.provider_data  # JSON::Any? — opaque data a custom provider keeps to replay the message
+msg.provider_data  # JSON::Any? — data each provider keeps, under its own key, to replay the message
+                   # (OpenAI provider: {"openai" => {"endpoint" => ..., "model" => ..., "reasoning_details" => [...]}}; ToolCall has the same slot)
 ```
 
 ---
@@ -520,6 +553,9 @@ Agent::Config.new(
   max_retries:                      Int32 = 2,                # 0 turns retrying off
   retry_base_delay:                 Time::Span | Int32 = 1,   # first backoff; doubles per retry, with jitter
   retry_max_delay:                  Time::Span | Int32 = 30,  # longest wait; a longer Retry-After isn't retried
+  reasoning_effort:                 Agent::ReasoningEffort? = nil, # :off, :minimal, :low, :medium, :high, :xhigh, :max — mapped per provider
+  extra_body:                       Hash(String, JSON::Any)? = nil, # extra request fields; never replaces one the provider sets
+  replay_reasoning:                 Bool = true,              # send reasoning back on later requests; off for a server that rejects it
 )
 ```
 

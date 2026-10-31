@@ -85,7 +85,9 @@ class Agent
     # Streaming: chunks go to the channel. Left: the consumer left early,
     # so chunks are dropped.
     @stream_state = StreamState::Waiting
-    @backlog = [] of Chunk
+    # Consecutive chunks of a kind are joined, so a long reply waiting for
+    # #stream costs its text, not an object per token.
+    @backlog = [] of {ChunkKind, String::Builder}
     @chunks_pushed = 0_i64
     @finish_reason : String?
     @error : Agent::Error?
@@ -194,9 +196,9 @@ class Agent
     def stream(& : Chunk -> _) : Nil
       backlog = synchronize do
         @stream_state = StreamState::Streaming
-        @backlog.tap { @backlog = [] of Chunk }
+        @backlog.tap { @backlog = [] of {ChunkKind, String::Builder} }
       end
-      backlog.each { |chunk| yield chunk }
+      backlog.each { |kind, text| yield Chunk.new(text.to_s, kind) }
       loop do
         chunk = @chunk_channel.receive
         yield chunk
@@ -222,6 +224,16 @@ class Agent
       end
     end
 
+    # A tool call name stays its own chunk: two calls' names must not join.
+    private def queue(chunk : Chunk) : Nil
+      last = @backlog.last?
+      if last && last[0] == chunk.kind && !chunk.kind.tool_call_name?
+        last[1] << chunk.text
+      else
+        @backlog << {chunk.kind, String::Builder.new.tap(&.<<(chunk.text))}
+      end
+    end
+
     # Internal: push a chunk (safe to call from any fiber).
     #
     # Until #stream is called, chunks queue in memory without blocking, so
@@ -237,7 +249,7 @@ class Agent
       queued = synchronize do
         @chunks_pushed += 1
         case @stream_state
-        in .waiting?   then @backlog << chunk; true
+        in .waiting?   then queue(chunk); true
         in .left?      then true
         in .streaming? then false
         end

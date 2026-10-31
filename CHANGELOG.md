@@ -69,6 +69,38 @@
 
 ### Added
 
+- Reasoning support:
+  - `Config#reasoning_effort` takes an `Agent::ReasoningEffort` (`:off`
+    through `:max`), the same for every provider. The OpenAI provider sends
+    it as `reasoning_effort`, or as `reasoning: {effort:}` on openrouter.ai.
+    `#ask(reasoning_effort:)` overrides it for one request, and a handler
+    can change it per provider call through `TurnContext#options`.
+  - `Config#extra_body` adds request fields Config doesn't name, such as a
+    reasoning budget. It never replaces a field the provider sets.
+  - Reasoning is kept in `provider_data` and sent back on later requests
+    in the shape the endpoint returned it, so it survives a tool loop and
+    `dump`/`load`: `reasoning_details` blocks (OpenRouter), signed and
+    encrypted ones included, unchanged; a tool call's `extra_content`
+    (Gemini's thought signature); `reasoning_content` text (DeepSeek, which
+    refuses a tool request without it; Kimi; vLLM); Mistral's thinking
+    chunks. It is keyed by provider, endpoint and model, and only goes back
+    where it came from. `Config#replay_reasoning` (default on) turns it off.
+  - Mistral's `content` arrays of thinking and text chunks are read. Before,
+    they were dropped, answer text included.
+  - A cancelled reply keeps its text but drops its replay data, since an
+    unsigned block would be refused.
+  - `Usage#reasoning_tokens` comes from
+    `completion_tokens_details.reasoning_tokens`.
+- `ToolCall#provider_data`, the same slot as on `Message`.
+- `Agent::RequestOptions` and `Provider::Base#build_request(messages, tools,
+  options)`. The default implementation calls the two-argument form, so
+  existing providers keep working.
+- `#dump` writes version 2; `#load` refuses a dump newer than it supports.
+- Long streams no longer cost quadratic time: reasoning blocks and tool
+  call arguments are appended in place instead of re-concatenated per
+  fragment.
+- Chunks waiting for `Response#stream` are joined per kind, so a long reply
+  costs its text rather than an object per token.
 - Retries: a model call that fails transiently before it streamed any
   output is retried up to `Config#max_retries` times (default 2) with
   jittered exponential backoff (`retry_base_delay`, default 1 s), honouring
@@ -107,8 +139,8 @@
   `tool_result` block) can send it.
 - `Message#provider_data : JSON::Any?`: an opaque slot for what a custom
   provider needs to replay a message exactly (signed reasoning blocks,
-  citations). Kept through `dump`/`load`, compared by `==`, never sent by
-  the OpenAI provider.
+  citations). Kept through `dump`/`load` and compared by `==`. The OpenAI
+  provider keeps `reasoning_details` there (see above).
 
 ## [0.2.0] - 2026-10-19
 

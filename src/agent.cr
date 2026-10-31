@@ -1,4 +1,5 @@
 require "./agent/version"
+require "./agent/request_options"
 require "./agent/config"
 require "./agent/error"
 require "./agent/json_converter"

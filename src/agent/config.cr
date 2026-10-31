@@ -21,6 +21,19 @@ class Agent
     # (`stream_options: {include_usage: true}` for OpenAI-compatible APIs).
     # On by default; off for a server that rejects the field.
     getter? include_usage : Bool
+    # How hard a reasoning model should think; each provider maps it to its
+    # own field. `#ask(reasoning_effort:)` overrides it for one request.
+    getter reasoning_effort : ReasoningEffort?
+    # Extra top-level fields for the request body, for options the provider
+    # supports but Config doesn't name (OpenRouter's `reasoning` object,
+    # vLLM's `chat_template_kwargs`, ...). Never replaces a field the
+    # provider sets itself.
+    getter extra_body : Hash(String, JSON::Any)?
+    # Send a model's reasoning back with its later requests, in the form its
+    # endpoint returned it. Several providers require it in a tool loop
+    # (DeepSeek answers 400 without it); turn it off only for a server that
+    # rejects it.
+    getter? replay_reasoning : Bool
 
     # --- Per-read SSE timeout knobs ---
     # See AGENTS.md "dynamic read-timeout to fail-fast on hung SSE connections".
@@ -80,6 +93,9 @@ class Agent
       @max_retries : Int32 = 2,
       retry_base_delay : Time::Span | Int32 = 1,
       retry_max_delay : Time::Span | Int32 = 30,
+      @reasoning_effort : ReasoningEffort? = nil,
+      @extra_body : Hash(String, JSON::Any)? = nil,
+      @replay_reasoning : Bool = true,
     )
       validate_temperature(@temperature)
       validate_max_tokens(@max_tokens)

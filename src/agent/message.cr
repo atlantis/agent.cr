@@ -294,13 +294,17 @@ class Agent
     getter id : String
     getter name : String
     getter arguments : String
+    # Provider-specific data to replay this call exactly (Gemini's thought
+    # signature, ...). Opaque to the agent loop, like `Message#provider_data`.
+    getter provider_data : JSON::Any?
 
-    def initialize(@id : String, @name : String, @arguments : String)
+    def initialize(@id : String, @name : String, @arguments : String, @provider_data : JSON::Any? = nil)
     end
 
     # :nodoc:
     def ==(other : self) : Bool
-      @id == other.id && @name == other.name && @arguments == other.arguments
+      @id == other.id && @name == other.name && @arguments == other.arguments &&
+        @provider_data == other.provider_data
     end
 
     def ==(other) : Bool
@@ -323,6 +327,10 @@ class Agent
     # Prompt tokens written to the cache on this request (Anthropic
     # `cache_creation_input_tokens`); nil for providers that don't report it.
     getter cache_creation_tokens : Int32?
+    # Completion tokens the model spent reasoning (OpenAI
+    # `completion_tokens_details.reasoning_tokens`). Part of
+    # `completion_tokens`, not in addition to it.
+    getter reasoning_tokens : Int32?
 
     def initialize(
       @prompt_tokens = nil,
@@ -330,6 +338,7 @@ class Agent
       @total_tokens = nil,
       @cached_tokens = nil,
       @cache_creation_tokens = nil,
+      @reasoning_tokens = nil,
     )
     end
 
@@ -344,6 +353,7 @@ class Agent
         add(total_tokens, other.total_tokens),
         add(cached_tokens, other.cached_tokens),
         add(cache_creation_tokens, other.cache_creation_tokens),
+        add(reasoning_tokens, other.reasoning_tokens),
       )
     end
 
@@ -375,10 +385,12 @@ class Agent
     # has one (e.g. `is_error` on an Anthropic `tool_result` block) send it.
     @[JSON::Field(key: "is_error")]
     getter is_error : Bool?
-    # Provider-specific data a custom provider needs to replay the message
-    # exactly as it came (signed reasoning blocks, citations, ...). Opaque to
-    # the agent loop: kept through `dump`/`load` and `history`, never sent by
-    # the OpenAI provider.
+    # Provider-specific data a provider needs to replay the message exactly
+    # as it came (signed reasoning blocks, citations, ...). Opaque to the
+    # agent loop and kept through `dump`/`load` and `history`. Each provider
+    # writes under its own key and reads only that key, so a conversation can
+    # move between providers: the OpenAI provider uses
+    # `{"openai" => {"endpoint" => ..., "model" => ..., "reasoning_details" => [...]}}`.
     @[JSON::Field(key: "provider_data")]
     getter provider_data : JSON::Any?
 

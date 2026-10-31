@@ -14,6 +14,13 @@ class Agent
       # and the JSON body string.
       abstract def build_request(messages : Array(Message), tools : Array(Tool)?) : NamedTuple(path: String, headers: HTTP::Headers, body: String)
 
+      # Like the above, with the per-request options of the #ask. The agent
+      # calls this one; the default ignores the options, so a provider written
+      # before they existed keeps working.
+      def build_request(messages : Array(Message), tools : Array(Tool)?, options : RequestOptions) : NamedTuple(path: String, headers: HTTP::Headers, body: String)
+        build_request(messages, tools)
+      end
+
       # Parse a streaming SSE response body and push Chunks onto `response`.
       # Returns the final assembled {Message, Usage, finish_reason}.
       # The `cancel` callback returns true if the caller has requested cancellation.

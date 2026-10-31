@@ -6,8 +6,11 @@ class Agent
   class TurnContext
     property messages : Array(Message)
     property tools : Array(Tool)?
+    # Per-request settings of the #ask; a handler may replace them for this
+    # provider call (e.g. a different reasoning effort per lane).
+    property options : RequestOptions
 
-    def initialize(@messages, @tools)
+    def initialize(@messages, @tools, @options = RequestOptions.new)
     end
   end
 
