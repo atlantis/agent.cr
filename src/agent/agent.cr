@@ -927,6 +927,7 @@ class Agent
             partial_msg = msg
             raise CancelledError.new
           end
+          check_tool_calls_complete(msg, finish_reason)
 
           {msg, usage, finish_reason}
         end
@@ -943,6 +944,16 @@ class Agent
         wait_unless_cancelled(delay, response)
       end
     end
+  end
+
+  # Finish reasons that end a reply early. Tool calls in such a reply may
+  # have half-written arguments (OpenAI "length", Anthropic "max_tokens"),
+  # or have been cut off by a refusal: none of them is run.
+  CUT_OFF_REASONS = {"length", "max_tokens", "model_context_window_exceeded", "refusal", "content_filter"}
+
+  private def check_tool_calls_complete(msg : Message, finish_reason : String?) : Nil
+    return unless msg.has_tool_calls? && finish_reason.in?(CUT_OFF_REASONS)
+    raise StreamError.new("the reply ended early (#{finish_reason}) with tool calls in it; none was run", finish_reason)
   end
 
   # A failure once the request was accepted, as a StreamError: the socket

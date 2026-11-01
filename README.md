@@ -153,6 +153,8 @@ config = Agent::Config.new(
 )
 ```
 
+With Anthropic models, trimming invalidates the thinking blocks kept after the cut. The Anthropic provider has the API drop them by default; see [Anthropic](#anthropic).
+
 ### Save and restore sessions
 
 Serialise a session (including cache key for prompt caching affinity):
@@ -449,7 +451,28 @@ crystal run examples/handlers.cr
 
 ## Provider system
 
-`agent-cr` uses a pluggable provider abstraction. The default provider is `Agent::Provider::OpenAI`, which works with any OpenAI-compatible API (OpenAI, OpenRouter, Anthropic via proxy, local llama.cpp, Ollama, etc.).
+`agent-cr` uses a pluggable provider abstraction. The default provider is `Agent::Provider::OpenAI`, which works with any OpenAI-compatible API (OpenAI, OpenRouter, local llama.cpp, Ollama, etc.). `Agent::Provider::Anthropic` speaks Anthropic's Messages API.
+
+### Anthropic
+
+```crystal
+config = Agent::Config.new(
+  api_key: ENV["ANTHROPIC_API_KEY"],
+  api_endpoint: Agent::Provider::Anthropic::DEFAULT_ENDPOINT, # or a gateway, path prefix and all
+  model: "claude-opus-5-5",
+  reasoning_effort: :high,
+)
+agent = Agent.new(config, provider: Agent::Provider::Anthropic.new(config))
+```
+
+It reads `api_key`, `api_endpoint`, `model`, `max_tokens` (default 64,000), `reasoning_effort`, `extra_headers` and `extra_body` from the config. It doesn't send `temperature`, which API version 2026-10-21 refuses.
+
+- **Thinking:** adaptive, with `display: "summarized"`, so `message.reasoning` holds a readable summary. Effort goes to `output_config.effort`. Current models can't turn thinking off, so `:off` and `:minimal` both ask for `"low"`. Pass `thinking: false` for a model without adaptive thinking (Haiku 4.5 and older), and `display: "omitted"` to stream no thinking text.
+- **Replay:** every reply's content blocks are kept in `provider_data` and sent back byte for byte, including signed thinking, `redacted_thinking` and server-tool blocks. They go only to the endpoint they came from. A cancelled reply keeps just its text.
+- **Trimmed history:** the API checks each thinking block against the conversation that produced it, so `max_history` trimming invalidates the blocks after the cut. By default the provider asks the API to drop those blocks (`prefix_mismatch: "drop_block"`, with the `thinking-binding-controls-2026-08-01` beta) instead of refusing the request. Pass `"error"` to be refused instead, or `nil` to send nothing and take your account's default (refused, for accounts created on or after 2026-08-31).
+- **Caching:** one breakpoint on the system prompt (it covers the tools) and one on the last user turn, so each call in a tool loop re-reads the transcript rather than re-sending it. Every system message goes into the system prompt. Adding one mid-conversation rewrites the prompt, so the cache restarts and earlier thinking is dropped.
+- **Tools:** inputs stream as they're generated (`eager_input_streaming`; pass `eager_input_streaming: false` for a gateway that rejects the field). The agent never runs the tool calls of a reply that hit its token limit or a refusal.
+- **Betas and options:** `anthropic-beta` in `extra_headers` merges with the provider's own beta, and `extra_body` adds request fields such as `fallbacks`.
 
 ### Switch endpoint for a compatible API
 

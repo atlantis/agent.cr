@@ -86,7 +86,7 @@ class Agent
 
     # Error codes, besides retryable HTTP statuses, that name a transient
     # failure (OpenAI and Anthropic spellings).
-    TRANSIENT_CODES = %w[server_error rate_limit_exceeded overloaded_error api_error timeout]
+    TRANSIENT_CODES = %w[server_error rate_limit_exceeded rate_limit_error overloaded_error api_error timeout]
 
     # Whether the failure may succeed on a later try. It is only acted on
     # before any output streamed; after that nothing is retried.

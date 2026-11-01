@@ -394,6 +394,27 @@ describe "Agent robustness" do
     end
   end
 
+  it "does not run the tool calls of a reply cut off by its token limit" do
+    cut = ->(ctx : HTTP::Server::Context) {
+      ctx.response.content_type = "text/event-stream"
+      call = {index: 0, id: "c1", type: "function", function: {name: "probe", arguments: %({"path":"/et)}}
+      ctx.response.puts "data: #{{choices: [{index: 0, delta: {tool_calls: [call]}}]}.to_json}"
+      ctx.response.puts "data: #{{choices: [{index: 0, delta: {} of String => String, finish_reason: "length"}]}.to_json}"
+      ctx.response.puts "data: [DONE]"
+      ctx.response.close
+      nil
+    }
+    with_script([cut]) do |agent, _|
+      ran = [] of String
+      agent.register_tool("probe", "probe") { |_| ran << "probe"; "ok" }
+      resp = agent.ask("go")
+      resp.join
+      resp.error.as(Agent::StreamError).code.should eq("length")
+      ran.should be_empty
+      agent.history.should be_empty
+    end
+  end
+
   it "skips the remaining tool calls once the response is cancelled" do
     calls = [{"c1", "first", "{}"}, {"c2", "second", "{}"}]
     with_script([tool_reply(calls)]) do |agent, _|

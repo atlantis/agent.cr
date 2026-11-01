@@ -66,9 +66,20 @@
 - A tool callback's exception message no longer reaches the model. It is
   logged, and the model sees `Error executing tool 'x': the tool failed`.
   Raise `Agent::ToolError` for a message the model should see.
+- The agent no longer runs the tool calls of a reply that ended early
+  (`length`, `max_tokens`, `refusal`, `content_filter`,
+  `model_context_window_exceeded`): their arguments may be half-written.
+  The turn fails with a `StreamError` whose code is the finish reason.
 
 ### Added
 
+- `Agent::Provider::Anthropic`, for Anthropic's Messages API, moved in
+  from Aureax. It streams text, thinking (summarized into
+  `Message#reasoning`), tool calls, and server-tool blocks, and keeps every
+  reply's blocks in `provider_data` to send back byte for byte. It maps
+  `Config#reasoning_effort` to `output_config.effort`, caches the system
+  prompt and the transcript, and has the API drop thinking blocks that
+  history trimming invalidated rather than refuse the request.
 - Reasoning support:
   - `Config#reasoning_effort` takes an `Agent::ReasoningEffort` (`:off`
     through `:max`), the same for every provider. The OpenAI provider sends

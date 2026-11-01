@@ -31,6 +31,11 @@ src/
         config.cr        # Provider::OpenAI < Base + OpenAI::Config
         request_body.cr  # OpenAI wire-format request builder
         stream_parser.cr # SSE parser, delta accumulation, usage parsing
+      anthropic/
+        anthropic.cr     # entry point, requires sub-files
+        provider.cr      # Provider::Anthropic < Base: headers, options, replay helpers
+        request_body.cr  # Messages API request builder (turns, cache breakpoints)
+        stream_parser.cr # Messages API event parser, content blocks, usage
 ```
 
 ### Provider separation
