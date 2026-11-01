@@ -19,12 +19,15 @@ class Agent
           openrouter : Bool = false,
           endpoint : String? = nil,
           replay : Bool = true,
+          caching : {PromptCaching, CacheTTL}? = nil,
         ) : Hash(String, JSON::Any)
+          wire = messages.map { |m| message_to_request_body(m, replay ? {endpoint, model} : nil) }
           body = {
             "model"    => JSON::Any.new(model),
-            "messages" => JSON::Any.new(messages.map { |m| message_to_request_body(m, replay ? {endpoint, model} : nil) }.map { |h| JSON::Any.new(h) }),
+            "messages" => JSON::Any.new(wire.map { |h| JSON::Any.new(h) }),
             "stream"   => JSON::Any.new(true),
           }
+          caching.try { |(mode, ttl)| mark_cache(body, wire, mode, ttl) }
 
           if include_usage
             body["stream_options"] = JSON::Any.new({"include_usage" => JSON::Any.new(true)})
@@ -69,6 +72,35 @@ class Agent
           extra_body.try &.each { |k, v| body[k] = v unless body.has_key?(k) }
 
           body
+        end
+
+        # Cache markers as OpenRouter takes them for Claude models, on content
+        # parts: the last system message (OpenRouter puts the tools ahead of
+        # it), and the latest user or tool message, or the API's own marker
+        # for the conversation (`cache_control` at the top level).
+        private def mark_cache(body : Hash(String, JSON::Any), wire : Array(Hash(String, JSON::Any)), mode : PromptCaching, ttl : CacheTTL) : Nil
+          mark = {"type" => JSON::Any.new("ephemeral")}
+          mark["ttl"] = JSON::Any.new("1h") if ttl.one_hour?
+          mark = JSON::Any.new(mark)
+          wire.reverse_each.find { |m| m["role"] == "system" }.try { |m| set_marker(m, mark) }
+          if mode.automatic?
+            body["cache_control"] = mark
+          else
+            wire.reverse_each.find(&.["role"].in?("user", "tool")).try { |m| set_marker(m, mark) }
+          end
+        end
+
+        # Text content becomes one text part, so it can carry the marker.
+        private def set_marker(message : Hash(String, JSON::Any), mark : JSON::Any) : Nil
+          parts = message["content"]?.try(&.as_a?).try(&.dup)
+          unless parts
+            # The API refuses a marker on an empty text block.
+            text = message["content"]?.try(&.as_s?).presence || return
+            parts = [JSON::Any.new({"type" => JSON::Any.new("text"), "text" => JSON::Any.new(text)})]
+          end
+          return if parts.empty?
+          parts[-1] = JSON::Any.new(parts[-1].as_h.merge({"cache_control" => mark}))
+          message["content"] = JSON::Any.new(parts)
         end
 
         # OpenAI has no "max"; its highest is "xhigh". "none" turns reasoning

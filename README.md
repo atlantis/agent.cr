@@ -470,7 +470,7 @@ It reads `api_key`, `api_endpoint`, `model`, `max_tokens` (default 64,000), `rea
 - **Thinking:** adaptive, with `display: "summarized"`, so `message.reasoning` holds a readable summary. Effort goes to `output_config.effort`. Current models can't turn thinking off, so `:off` and `:minimal` both ask for `"low"`. Pass `thinking: false` for a model without adaptive thinking (Haiku 4.5 and older), and `display: "omitted"` to stream no thinking text.
 - **Replay:** every reply's content blocks are kept in `provider_data` and sent back byte for byte, including signed thinking, `redacted_thinking` and server-tool blocks. They go only to the endpoint they came from. A cancelled reply keeps just its text.
 - **Trimmed history:** the API checks each thinking block against the conversation that produced it, so `max_history` trimming invalidates the blocks after the cut. By default the provider asks the API to drop those blocks (`prefix_mismatch: "drop_block"`, with the `thinking-binding-controls-2026-08-01` beta) instead of refusing the request. Pass `"error"` to be refused instead, or `nil` to send nothing and take your account's default (refused, for accounts created on or after 2026-08-31).
-- **Caching:** one breakpoint on the system prompt (it covers the tools) and one on the last user turn, so each call in a tool loop re-reads the transcript rather than re-sending it. Every system message goes into the system prompt. Adding one mid-conversation rewrites the prompt, so the cache restarts and earlier thinking is dropped.
+- **Caching:** markers on the system prompt and the latest turn, plus extra ones in a long turn; see [Prompt caching](#prompt-caching). Every system message goes into the system prompt, so adding one mid-conversation restarts the cache and drops earlier thinking.
 - **Tools:** inputs stream as they're generated (`eager_input_streaming`; pass `eager_input_streaming: false` for a gateway that rejects the field). The agent never runs the tool calls of a reply that hit its token limit or a refusal.
 - **Betas and options:** `anthropic-beta` in `extra_headers` merges with the provider's own beta, and `extra_body` adds request fields such as `fallbacks`.
 
@@ -579,6 +579,8 @@ Agent::Config.new(
   reasoning_effort:                 Agent::ReasoningEffort? = nil, # :off, :minimal, :low, :medium, :high, :xhigh, :max — mapped per provider
   extra_body:                       Hash(String, JSON::Any)? = nil, # extra request fields; never replaces one the provider sets
   replay_reasoning:                 Bool = true,              # send reasoning back on later requests; off for a server that rejects it
+  prompt_caching:                   Agent::PromptCaching = :explicit, # :explicit, :automatic, :off — see "Prompt caching"
+  cache_ttl:                        Agent::CacheTTL = :five_minutes,  # or :one_hour
 )
 ```
 
@@ -687,7 +689,34 @@ agent.close
 
 ### Prompt caching
 
-When using APIs that support prompt caching (e.g. OpenAI, DeepSeek), set an explicit `prompt_cache_key` or use `agent.load` to restore a previous session — both preserve cache affinity:
+A provider's cache holds the start of a prompt. A later request that begins with the same bytes reads that part from the cache, at a tenth of the price or less, instead of processing it again.
+
+Who places the cache markers depends on the provider:
+
+| Provider | Caching |
+| --- | --- |
+| OpenAI, DeepSeek, Grok, Gemini (implicit) | Automatic. `prompt_caching` and `cache_ttl` are ignored. |
+| `Agent::Provider::Anthropic` | Markers the provider places. |
+| Claude models on OpenRouter (OpenAI provider) | The same markers, on OpenRouter's content parts. |
+
+`prompt_caching` picks the markers:
+- **`:explicit`** (default): one marker on the system prompt, which covers the tools ahead of it, or on the last tool when there's no system prompt. Another goes on the latest user or tool-result turn, so each call of a tool loop reads the transcript from the cache. On Anthropic, a turn longer than the cache's 20-position lookback also gets a marker every 15 positions, within the API's limit of four. A run of parallel tool calls or results counts as one position.
+- **`:automatic`**: the system-prompt marker, plus a top-level `cache_control` so the API places the conversation's marker itself. Anthropic recommends it for agent loops, but some platforms reject the field.
+- **`:off`**: no markers.
+
+`cache_ttl: :one_hour` keeps entries for an hour instead of five minutes. A write then costs twice the input price instead of 1.25 times. It pays off when a conversation pauses for longer than five minutes, such as a chat picked up later in the day.
+
+What makes the cache miss, without any error:
+- **Editing the history:** trimming with `max_history`, removing or changing an earlier message, or a handler adding text it later takes out. Everything after the edit is processed again.
+- **Changing the system prompt or the tools:** a per-request tool (`ask(tools:)`), registering or enabling a tool mid-conversation, or a system message added later. This restarts everything, the tools and system prompt included.
+- **Per-request content at the start:** a timestamp or request id in the system prompt, for example. Put it in the user turn instead.
+- **Changing `reasoning_effort` or the thinking settings mid-conversation.** The conversation is processed again. Pick them per agent, not per request.
+- **A short prompt:** Anthropic caches nothing under the model's minimum, 512 tokens on current models and 1,024 or 4,096 on older ones. OpenAI's minimum is 1,024.
+- **Parallel requests:** an entry can be read only once its first response starts streaming, so requests with the same prefix sent at the same moment each pay full price.
+
+`Response#metadata` shows whether caching works: `cached_tokens` counts tokens read from the cache, and `cache_creation_tokens` counts tokens written. A tool loop that reads almost nothing back has broken its prefix.
+
+OpenAI also routes requests by `prompt_cache_key`. Set one explicitly, or use `agent.load` to restore a previous session; both preserve cache affinity:
 
 ```crystal
 # Auto-generated cache key tied to the session

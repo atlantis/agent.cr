@@ -73,6 +73,16 @@
 
 ### Added
 
+- Prompt caching settings shared by providers: `Config#prompt_caching`
+  (`:explicit`, the default; `:automatic`, where the API marks the
+  conversation itself; `:off`) and `Config#cache_ttl` (`:five_minutes` or
+  `:one_hour`). The Anthropic provider marks the last tool when there is no
+  system prompt, and adds markers inside a turn longer than the cache's
+  20-position lookback. The OpenAI provider now marks the system prompt and
+  latest turn for Claude models on OpenRouter, which cache nothing
+  otherwise, and reads OpenRouter's `cache_write_tokens` into
+  `Usage#cache_creation_tokens`.
+
 - `Agent::Provider::Anthropic`, for Anthropic's Messages API, moved in
   from Aureax. It streams text, thinking (summarized into
   `Message#reasoning`), tool calls, and server-tool blocks, and keeps every

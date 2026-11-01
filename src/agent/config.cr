@@ -1,6 +1,25 @@
 require "uri"
 
 class Agent
+  # How a provider marks the prompt for its cache. Providers that cache on
+  # their own (OpenAI, DeepSeek, Grok, Gemini's implicit cache) ignore it.
+  enum PromptCaching
+    # Markers the provider places: the system prompt, and the latest turn.
+    Explicit
+    # The system prompt marked, and the API marks the latest turn itself
+    # (Anthropic's top-level `cache_control`). Not on every platform.
+    Automatic
+    Off
+  end
+
+  # How long a cache entry lives after its last read: 5 minutes, or an hour
+  # (a write costs 2x instead of 1.25x; it pays off when a conversation
+  # pauses between 5 minutes and an hour).
+  enum CacheTTL
+    FiveMinutes
+    OneHour
+  end
+
   class Config
     getter api_endpoint : String
     getter api_key : String?
@@ -34,6 +53,10 @@ class Agent
     # (DeepSeek answers 400 without it); turn it off only for a server that
     # rejects it.
     getter? replay_reasoning : Bool
+    # Prompt cache markers, and how long their entries live. See
+    # `PromptCaching`.
+    getter prompt_caching : PromptCaching
+    getter cache_ttl : CacheTTL
 
     # --- Per-read SSE timeout knobs ---
     # See AGENTS.md "dynamic read-timeout to fail-fast on hung SSE connections".
@@ -96,6 +119,8 @@ class Agent
       @reasoning_effort : ReasoningEffort? = nil,
       @extra_body : Hash(String, JSON::Any)? = nil,
       @replay_reasoning : Bool = true,
+      @prompt_caching : PromptCaching = PromptCaching::Explicit,
+      @cache_ttl : CacheTTL = CacheTTL::FiveMinutes,
     )
       validate_temperature(@temperature)
       validate_max_tokens(@max_tokens)

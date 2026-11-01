@@ -52,6 +52,8 @@ class Agent
       @api_key : String?
       @extra_headers : Hash(String, String)?
       @extra_body : Hash(String, JSON::Any)?
+      @caching : PromptCaching
+      @cache_ttl : CacheTTL
 
       def initialize(
         config : Agent::Config,
@@ -85,6 +87,8 @@ class Agent
         @reasoning_effort = config.reasoning_effort
         @extra_headers = config.extra_headers
         @extra_body = config.extra_body
+        @caching = config.prompt_caching
+        @cache_ttl = config.cache_ttl
       end
 
       def base_uri : URI
@@ -117,6 +121,8 @@ class Agent
           eager_input_streaming: @eager_input_streaming,
           extra_body: @extra_body,
           endpoint: @endpoint,
+          caching: @caching,
+          ttl: @cache_ttl,
         )
         {path: path, headers: headers, body: body.to_json}
       end

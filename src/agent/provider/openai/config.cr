@@ -32,6 +32,10 @@ class Agent
         getter extra_body : Hash(String, JSON::Any)?
         # See Agent::Config#replay_reasoning?.
         getter? replay_reasoning : Bool
+        # See Agent::Config#prompt_caching; acted on only where the model
+        # needs markers (see #cache_markers?).
+        getter prompt_caching : PromptCaching
+        getter cache_ttl : CacheTTL
 
         # Cached parsed URI — computed once at construction.
         getter parsed_uri : URI
@@ -51,6 +55,8 @@ class Agent
           @reasoning_effort : ReasoningEffort? = nil,
           @extra_body : Hash(String, JSON::Any)? = nil,
           @replay_reasoning : Bool = true,
+          @prompt_caching : PromptCaching = PromptCaching::Explicit,
+          @cache_ttl : CacheTTL = CacheTTL::FiveMinutes,
         )
           validate_temperature(@temperature)
           validate_max_tokens(@max_tokens)
@@ -76,6 +82,14 @@ class Agent
         # servers that follow it take `reasoning_effort`.
         def openrouter? : Bool
           @parsed_uri.host.try(&.ends_with?("openrouter.ai")) || false
+        end
+
+        # Whether the endpoint caches only where the prompt is marked:
+        # Claude models on OpenRouter. OpenAI and most others cache on their
+        # own.
+        def cache_markers? : Bool
+          return false if @prompt_caching.off? || !openrouter?
+          @model.includes?("anthropic/") || @model.includes?("claude")
         end
 
         # The chat completions path derived from api_endpoint.
@@ -145,6 +159,8 @@ class Agent
           reasoning_effort: config.reasoning_effort,
           extra_body: config.extra_body,
           replay_reasoning: config.replay_reasoning?,
+          prompt_caching: config.prompt_caching,
+          cache_ttl: config.cache_ttl,
         )
         @cache_key = cache_key
       end
@@ -178,6 +194,7 @@ class Agent
           extra_body: @config.extra_body,
           endpoint: @config.replay_endpoint,
           replay: @config.replay_reasoning?,
+          caching: @config.cache_markers? ? {@config.prompt_caching, @config.cache_ttl} : nil,
         )
 
         headers = HTTP::Headers.new

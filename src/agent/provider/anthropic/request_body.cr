@@ -19,7 +19,19 @@ class Agent
           ReasoningEffort::Max     => "max",
         }
 
-        EPHEMERAL = JSON::Any.new({"type" => JSON::Any.new("ephemeral")})
+        # The API allows 4 markers; the system prompt and the latest turn
+        # take 2, which leaves 2 for a long turn (see #mark_cache).
+        MAX_MARKERS = 4
+        # A marker finds the previous cache entry only within 20 positions
+        # back, so a turn longer than that gets a marker every 15.
+        LOOKBACK      = 20
+        MARKER_STRIDE = 15
+
+        def marker(ttl : CacheTTL) : JSON::Any
+          h = {"type" => JSON::Any.new("ephemeral")}
+          h["ttl"] = JSON::Any.new("1h") if ttl.one_hour?
+          JSON::Any.new(h)
+        end
 
         def build(
           messages : Array(Message),
@@ -34,6 +46,8 @@ class Agent
           eager_input_streaming : Bool = false,
           extra_body : Hash(String, JSON::Any)? = nil,
           endpoint : String? = nil,
+          caching : PromptCaching = PromptCaching::Explicit,
+          ttl : CacheTTL = CacheTTL::FiveMinutes,
         ) : Hash(String, JSON::Any)
           body = {
             "model"      => JSON::Any.new(model),
@@ -58,19 +72,23 @@ class Agent
           # only right after a user message. Adding one rewrites the prompt,
           # so the cache restarts and earlier thinking is dropped (see
           # `prefix_mismatch`).
-          system = messages.select(&.role.system?)
-          unless system.empty?
-            blocks = system.map { |m| text_block(m.content.to_s) }
-            # One breakpoint on the last system block caches the tools and
-            # the prompt.
-            blocks.last.as_h["cache_control"] = EPHEMERAL
-            body["system"] = JSON::Any.new(blocks)
-          end
+          system = messages.select(&.role.system?).map { |m| text_block(m.content.to_s) }
+          body["system"] = JSON::Any.new(system) unless system.empty?
+          tool_defs = tools.try(&.map { |t| tool(t, eager_input_streaming) }) || [] of JSON::Any
+          body["tools"] = JSON::Any.new(tool_defs) unless tool_defs.empty?
+          turns = turns(messages.reject(&.role.system?), endpoint)
+          body["messages"] = JSON::Any.new(turns)
 
-          if (ts = tools) && !ts.empty?
-            body["tools"] = JSON::Any.new(ts.map { |t| tool(t, eager_input_streaming) })
+          unless caching.off?
+            # Tools render before the system prompt, so one marker on the
+            # last of them caches both.
+            (system.last? || tool_defs.last?).try { |b| b.as_h["cache_control"] = marker(ttl) }
+            if caching.automatic?
+              body["cache_control"] = marker(ttl)
+            else
+              mark_cache(turns, marker(ttl))
+            end
           end
-          body["messages"] = JSON::Any.new(turns(messages.reject(&.role.system?), endpoint))
 
           extra_body.try &.each { |k, v| body[k] = v unless body.has_key?(k) }
           body
@@ -117,17 +135,61 @@ class Agent
             end
           end
           flush.call
-          mark_cache(turns)
           turns
         end
 
-        # A breakpoint on the last block of the last user turn caches the
+        # A marker on the last block of the last user turn caches the
         # transcript so far, so each call of a tool loop re-reads it rather
-        # than re-sends it. Moving a breakpoint doesn't count as editing the
+        # than re-sends it. Moving a marker doesn't count as editing the
         # history.
-        private def mark_cache(turns : Array(JSON::Any)) : Nil
-          last = turns.reverse_each.find { |t| t["role"] == "user" } || return
-          last["content"].as_a.last?.try(&.as_h.[]=("cache_control", EPHEMERAL))
+        #
+        # The previous request's marker sat on the user turn before it. When
+        # more than LOOKBACK positions came since, the new marker can't find
+        # that entry, so markers go every MARKER_STRIDE positions back from
+        # the end, as many as the API allows.
+        private def mark_cache(turns : Array(JSON::Any), mark : JSON::Any) : Nil
+          users = turns.each_index.select { |i| turns[i]["role"] == "user" }.to_a
+          last = users.last? || return
+          positions = positions(turns, (users[-2]? || -1) + 1, last)
+          return if positions.empty?
+
+          marks = [positions.last]
+          if users.size > 1 && positions.size > LOOKBACK
+            i = positions.size - 1 - MARKER_STRIDE
+            # One marker is the system prompt's.
+            while i >= 0 && marks.size < MAX_MARKERS - 1
+              marks << positions[i]
+              i -= MARKER_STRIDE
+            end
+          end
+          marks.each { |(t, b)| set_marker(turns, t, b, mark) }
+        end
+
+        # Blocks a marker can go on from turn `first` through `last`, one per
+        # position: a run of tool_use blocks, or of tool_result blocks, is
+        # one position (its last block). Thinking blocks take no marker.
+        private def positions(turns : Array(JSON::Any), first : Int32, last : Int32) : Array({Int32, Int32})
+          out = [] of {Int32, Int32}
+          (first..last).each do |t|
+            blocks = turns[t]["content"].as_a
+            blocks.each_with_index do |b, i|
+              type = b["type"]?.try(&.as_s?)
+              next if type.in?({"thinking", "redacted_thinking"})
+              next if type.in?({"tool_use", "tool_result"}) && blocks[i + 1]?.try(&.["type"]?.try(&.as_s?)) == type
+              out << {t, i}
+            end
+          end
+          out
+        end
+
+        # A copy of the block gets the marker: an assistant turn's blocks
+        # are the reply's stored ones, sent back unchanged.
+        private def set_marker(turns : Array(JSON::Any), t : Int32, b : Int32, mark : JSON::Any) : Nil
+          blocks = turns[t]["content"].as_a.dup
+          block = blocks[b].as_h.dup
+          block["cache_control"] = mark
+          blocks[b] = JSON::Any.new(block)
+          turns[t].as_h["content"] = JSON::Any.new(blocks)
         end
 
         private def turn(role : String, blocks : Array(JSON::Any)) : JSON::Any
