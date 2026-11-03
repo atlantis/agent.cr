@@ -84,7 +84,10 @@
   `Agent#cancel_task(id)` let a block kill the process it waits on;
   `#discard_task(id)`, `#off_task_finished` and `Task#wait` round it out.
   `#register_task_kind` names work that `#background(kind:, data:)` starts
-  and `#load` relaunches after a restart instead of reporting it lost. An
+  and `#load` relaunches after a restart instead of reporting it lost.
+  `#background` without a block returns a task the application finishes
+  with `Task#complete`/`#fail` (or `#complete_task`/`#fail_task` by id),
+  for outcomes produced outside the agent; it survives `#load`. An
   outcome longer than `Config#max_task_result_chars` (30,000) is delivered
   as its start and end with `warning="truncated"` on the tag,
   and `#on_task_finished`, `#awaiting_tasks?`, `#running_tasks` and

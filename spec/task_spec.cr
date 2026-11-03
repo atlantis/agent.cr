@@ -465,6 +465,81 @@ describe Agent::Task do
     end
   end
 
+  it "lets the application finish a task it started without a block" do
+    with_script([tool_reply([{"c1", "settle", "{}"}]), text_reply("ok"), text_reply("noted")]) do |agent, requests|
+      agent.register_tool("settle", parameters: empty_schema) { agent.background("deploy 42 to settle", timeout: 1.minute).accepted }
+      agent.ask("go").message.content.should eq "ok"
+      task = agent.running_tasks.first
+      task.external?.should be_true
+      task.tool.should eq "settle"
+      agent.awaiting_tasks?.should be_true
+
+      agent.complete_task("nope", "x").should be_false
+      agent.complete_task(task.id, "deploy 42 is serving on 3 nodes").should be_true
+      agent.complete_task(task.id, "again").should be_false
+      await(agent, task)
+      task.status.done?.should be_true
+      agent.finished_tasks.should eq [task]
+
+      agent.ask("and?").message.content.should eq "noted"
+      text = text_of(requests[2]["messages"][-1])
+      text.should contain %(<task_result id="#{task.id}" tool="settle" description="deploy 42 to settle" status="done")
+      text.should contain "deploy 42 is serving on 3 nodes"
+
+      failed = agent.background("a check")
+      agent.fail_task(failed.id, "the rollback did not take: 2 containers still Down").should be_true
+      await(agent, failed)
+      failed.status.failed?.should be_true
+      failed.result.should eq "the rollback did not take: 2 containers still Down"
+      failed.fail("twice").should be_false
+
+      slow = agent.background("never reported", timeout: 20.milliseconds)
+      await(agent, slow)
+      slow.status.timed_out?.should be_true
+    end
+  end
+
+  it "completing a block's task from outside ends its sleep" do
+    with_script([] of HTTP::Server::Context -> Nil) do |agent, _requests|
+      woke = Channel(Bool).new(1)
+      task = agent.background { |t| woke.send(t.sleep(5.seconds)); "late" }
+      Fiber.yield
+      task.complete("early").should be_true
+      woke.receive.should be_false
+      await(agent, task)
+      task.result.should eq "early"
+    end
+  end
+
+  it "keeps an externally finished task waiting across a reload, with the time it had left" do
+    with_script([] of HTTP::Server::Context -> Nil) do |agent, _requests|
+      task = agent.background("a long wait", timeout: 1.minute)
+      restored = Agent.load(agent.config, agent.dump)
+      begin
+        again = restored.running_tasks.first
+        again.id.should eq task.id
+        again.external?.should be_true
+        restored.complete_task(task.id, "done elsewhere").should be_true
+        await(restored, again)
+        restored.finished_tasks.first.result.should eq "done elsewhere"
+      ensure
+        restored.close
+      end
+
+      # one whose time ran out while the process was down times out at once
+      stale = JSON.parse(agent.dump)
+      stale["tasks"][0].as_h["started_at"] = JSON::Any.new((Time.utc - 1.hour).to_rfc3339)
+      late = Agent.load(agent.config, stale.to_json)
+      begin
+        timed = late.running_tasks.first? || late.finished_tasks.first
+        await(late, timed)
+        timed.status.timed_out?.should be_true
+      ensure
+        late.close
+      end
+    end
+  end
+
   it "drops cancelled and duplicate tasks from a dump, and refuses broken ones" do
     with_script([] of HTTP::Server::Context -> Nil) do |agent, _requests|
       task = {id: "t-1", timeout_ms: 1000, started_at: Time.utc.to_rfc3339, status: "done", result: "r"}

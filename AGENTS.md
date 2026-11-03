@@ -479,7 +479,8 @@ resp.stream { |chunk| print chunk }
 - `#resume` never makes a request on its own; `#ask`/`#resume` from the
   agent fiber raise instead of deadlocking.
 - A closure cannot survive a restart: `load` relaunches only tasks whose
-  `kind` is registered (`register_task_kind`), the rest become `Lost`.
+  `kind` is registered (`register_task_kind`); an external one (no block,
+  finished by `Task#complete`) keeps waiting; the rest become `Lost`.
 - A task cannot be killed: cancel and timeout close its channel and run
   `on_cancel` hooks in their own fiber; the block must cooperate.
 - `turn_starts` keeps a task result with the turn it arrived in, so

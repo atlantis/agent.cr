@@ -101,6 +101,9 @@ class Agent
     # `data` is for the application; the model never sees it.
     getter kind : String?
     getter data : JSON::Any?
+    # Whether the application finishes this task (`#complete`, `#fail`)
+    # rather than a block: an outcome produced outside the agent.
+    getter? external : Bool
 
     @status = Status::Running
     @result : String? = nil
@@ -112,7 +115,21 @@ class Agent
 
     def initialize(@timeout : Time::Span, @tool : String? = nil, @description : String? = nil,
                    @id : String = Task.generate_id, @started_at : Time = Time.utc,
-                   @kind : String? = nil, @data : JSON::Any? = nil)
+                   @kind : String? = nil, @data : JSON::Any? = nil, @external : Bool = false)
+    end
+
+    # End the task with `result` as its outcome, from any fiber. For a task
+    # the application finishes (see `Agent#background` without a block),
+    # or to end a block's early: its `#sleep` then returns false. Returns
+    # false if the task had already ended.
+    def complete(result : String) : Bool
+      finish(Status::Done, result)
+    end
+
+    # End the task as failed; `reason` is what the model reads. Returns
+    # false if the task had already ended.
+    def fail(reason : String, error : Exception? = nil) : Bool
+      finish(Status::Failed, reason, error)
     end
 
     # Random, 12 hex characters: short enough for the model to quote, and
@@ -325,6 +342,7 @@ class Agent
         json.field "id", @id
         json.field "tool", @tool if @tool
         json.field "description", @description if @description
+        json.field "external", true if @external
         json.field "kind", @kind if @kind
         json.field "data", @data if @data
         json.field "timeout_ms", @timeout.total_milliseconds.to_i64
@@ -355,6 +373,7 @@ class Agent
         Time.parse_rfc3339(h["started_at"].as_s),
         h["kind"]?.try(&.as_s?),
         h["data"]?,
+        h["external"]?.try(&.as_bool?) || false,
       )
       status = Status.parse(h["status"].as_s)
       unless status.running?

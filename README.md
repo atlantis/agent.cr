@@ -383,6 +383,24 @@ Limits and lifecycle:
 - Task ids are `t-` and 12 random hex characters. `Config#task_id_generator` (a `-> String`) substitutes your own scheme, and `background(id:)` names one task; an id still running or awaiting delivery raises `Agent::TaskIdError`, which the model sees when it happens inside a tool.
 - `#ask` and `#resume` raise when called from the agent's own fiber (inside a tool callback or handler), since they would wait for themselves.
 
+#### Outcomes from outside
+
+Not every outcome comes from a block. A webhook, a scheduler checking state every so often, or a person may be what settles the question. Start the task without a block and finish it from wherever the answer appears, from any fiber:
+
+```crystal
+agent.register_tool("rollback", "Roll a deployment back", parameters: schema) do |args|
+  start_rollback(args["id"])
+  agent.background("rollback of #{args["id"]} to settle", timeout: 45.minutes).accepted
+end
+
+# later, in your own checker
+agent.complete_task(id, "deployment 42 reverted; the service has no alarm")
+# or
+agent.fail_task(id, "the rollback did not take: 2 containers still Down")
+```
+
+The model reads the same `<task_result>` as for any task, so it needs no second format, and the outcome goes through the same handlers, cap, limit, timeout, cancel and `dump`. A task like this still running when dumped stays running after `load`, with the time it had left, for your checker to finish; one whose time ran out while the process was down times out at once. `Task#complete` also ends a block's task early: its `Task#sleep` returns false. If a success needs no words from the model, `discard_task(id)` after completing drops the outcome unread.
+
 #### Restarts
 
 A task is a closure, so it cannot survive the process. After a restart `load` queues each task the dump had running as `status="lost"`, and the model is told its result is never coming. To do better, define the work once under a name and start tasks by name and data; `load` then relaunches them from the dump:

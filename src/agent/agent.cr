@@ -243,6 +243,35 @@ class Agent
     start_task(description, timeout, id, nil, nil, block)
   end
 
+  # Start a task the application finishes: no block runs, and the outcome
+  # comes later through `Task#complete` or `Task#fail` (or
+  # `#complete_task`/`#fail_task` by id), from any fiber. For results
+  # produced outside the agent: a webhook, a scheduler checking state, a
+  # person. Until then it counts against the limit and the timeout, and
+  # `#cancel_task` and `Task#on_cancel` work as usual. One still running
+  # when dumped stays running after `#load`, with the time it had left.
+  #
+  # ```
+  # task = agent.background("deploy 42 to settle", timeout: 45.minutes)
+  # # ... later, from the checker:
+  # agent.complete_task(task.id, "deploy 42 is serving on 3 nodes")
+  # ```
+  def background(description : String? = nil, timeout : Time::Span? = nil, id : String? = nil) : Task
+    start_task(description, timeout, id, nil, nil, nil)
+  end
+
+  # `Task#complete` on the running task with this id. Returns false when
+  # none has it.
+  def complete_task(id : String, result : String) : Bool
+    @tasks.lock { |t| t.running.find { |x| x.id == id } }.try(&.complete(result)) || false
+  end
+
+  # `Task#fail` on the running task with this id. Returns false when none
+  # has it.
+  def fail_task(id : String, reason : String, error : Exception? = nil) : Bool
+    @tasks.lock { |t| t.running.find { |x| x.id == id } }.try(&.fail(reason, error)) || false
+  end
+
   # Start a task of a registered kind (see `#register_task_kind`) with the
   # data its block needs. Unlike a task given a block, it survives a
   # restart: `#load` relaunches it from `kind` and `data` when the kind is
@@ -269,7 +298,7 @@ class Agent
     @task_kinds.lock { |k| k[kind] = block }
   end
 
-  private def start_task(description : String?, timeout : Time::Span?, id : String?, kind : String?, data : JSON::Any?, block : Task -> String) : Task
+  private def start_task(description : String?, timeout : Time::Span?, id : String?, kind : String?, data : JSON::Any?, block : (Task -> String)?) : Task
     @state_mutex.synchronize { raise ClosedError.new if @closed }
     span = timeout || @config.background_task_timeout
     raise ArgumentError.new("timeout must be positive, got #{span}") unless span > Time::Span.zero
@@ -277,7 +306,7 @@ class Agent
     raise TaskIdError.new("task id must not be empty") if id.empty?
 
     tool = Fiber.current == @fiber ? @current_tool : nil
-    task = Task.new(span, tool: tool, description: description, id: id, kind: kind, data: data)
+    task = Task.new(span, tool: tool, description: description, id: id, kind: kind, data: data, external: block.nil?)
     @tasks.lock do |t|
       raise TaskIdError.new("task id #{id} is already in use") if t.find(id)
       raise TaskLimitError.new(@config.max_background_tasks) if t.running.size >= @config.max_background_tasks
@@ -289,27 +318,33 @@ class Agent
 
   # Two fibers per task: the worker runs the block; the watcher finishes
   # the task on the outcome, the timeout or a cancel, whichever is first.
-  private def run_task(task : Task, block : Task -> String) : Nil
+  # Run `block` (if any) in a fiber of its own, and watch the task for its
+  # outcome, the timeout (`remaining` of it) or an end from outside: a
+  # cancel, or `Task#complete`/`#fail`, both of which close the cancel
+  # channel.
+  private def run_task(task : Task, block : (Task -> String)?, remaining : Time::Span = task.timeout) : Nil
     done = Channel({Task::Status, String?, Exception?}).new(1)
-    spawn(name: "agent task #{task.id}") do
-      outcome = begin
-        {Task::Status::Done, block.call(task), nil}
-      rescue ex : ToolError
-        {Task::Status::Failed, ex.message, ex}
-      rescue ex
-        Log.error(exception: ex) { "Agent: background task #{task.id} raised" }
-        {Task::Status::Failed, "the task failed", ex}
+    if block
+      spawn(name: "agent task #{task.id}") do
+        outcome = begin
+          {Task::Status::Done, block.call(task), nil}
+        rescue ex : ToolError
+          {Task::Status::Failed, ex.message, ex}
+        rescue ex
+          Log.error(exception: ex) { "Agent: background task #{task.id} raised" }
+          {Task::Status::Failed, "the task failed", ex}
+        end
+        done.send(outcome)
       end
-      done.send(outcome)
     end
     spawn(name: "agent task watch #{task.id}") do
       select
       when outcome = done.receive
         task.finish(outcome[0], outcome[1], outcome[2])
-      when timeout(task.timeout)
+      when timeout(remaining)
         task.finish(Task::Status::TimedOut, "timed out after #{Task.humanize(task.timeout)}")
       when task.cancel_signal.receive?
-        # cancelled: already finished
+        # ended from outside: already finished
       end
       task_finished(task)
     end
@@ -555,14 +590,15 @@ class Agent
   end
 
   # Make the dumped tasks this agent's. A task the dump had running is kept
-  # if this agent is still running it (the dump was its own snapshot), and
-  # relaunched if its kind is registered; otherwise its fiber is gone and it
-  # is queued as `Lost`, so the model learns the result is never coming.
+  # if this agent is still running it (the dump was its own snapshot);
+  # relaunched if its kind is registered; kept waiting, for the time it had
+  # left, if the application finishes it; otherwise its fiber is gone and
+  # it is queued as `Lost`, so the model learns the result is never coming.
   # Running tasks the dump does not know are the old conversation's and are
   # cancelled.
   private def adopt_tasks(dumped : Array(Task)) : Nil
     kinds = @task_kinds.lock(&.dup)
-    relaunch = [] of {Task, (Task -> String)}
+    relaunch = [] of {Task, (Task -> String)?, Time::Span}
     cancelled = @tasks.lock do |t|
       alive = t.running.select { |x| dumped.any? { |d| d.running? && d.id == x.id } }
       gone = t.running - alive
@@ -573,7 +609,10 @@ class Agent
         next if alive.any? { |x| x.id == d.id }
         if d.running? && (block = d.kind.try { |k| kinds[k]? })
           t.running << d
-          relaunch << {d, block}
+          relaunch << {d, block, d.timeout}
+        elsif d.running? && d.external?
+          t.running << d
+          relaunch << {d, nil, {d.timeout - d.elapsed, Time::Span.zero}.max}
         else
           d.finish(Task::Status::Lost, "this task did not survive a reload of the conversation") if d.running?
           t.finished << d
@@ -582,7 +621,7 @@ class Agent
       gone
     end
     cancelled.each(&.cancel)
-    relaunch.each { |(task, block)| run_task(task, block) }
+    relaunch.each { |(task, block, remaining)| run_task(task, block, remaining) }
   end
 
   # Reset the conversation history back to the system prompt only. Running
