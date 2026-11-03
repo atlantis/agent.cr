@@ -21,7 +21,7 @@ class Agent
           replay : Bool = true,
           caching : {PromptCaching, CacheTTL}? = nil,
         ) : Hash(String, JSON::Any)
-          wire = messages.map { |m| message_to_request_body(m, replay ? {endpoint, model} : nil) }
+          wire = Message.coalesce_users(messages).map { |m| message_to_request_body(m, replay ? {endpoint, model} : nil) }
           body = {
             "model"    => JSON::Any.new(model),
             "messages" => JSON::Any.new(wire.map { |h| JSON::Any.new(h) }),

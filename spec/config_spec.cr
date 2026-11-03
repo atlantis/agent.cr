@@ -24,3 +24,19 @@ describe Agent::Config do
     config.temperature.should eq(0.7)
   end
 end
+
+describe Agent::Config, "background tasks" do
+  it "defaults to four tasks and five minutes, taking seconds or a span" do
+    config = Agent::Config.new
+    config.max_background_tasks.should eq 4
+    config.background_task_timeout.should eq 5.minutes
+    Agent::Config.new(max_background_tasks: 0, background_task_timeout: 30).background_task_timeout.should eq 30.seconds
+    Agent::Config.new(background_task_timeout: 2.hours).background_task_timeout.should eq 2.hours
+    expect_raises(ArgumentError, "max_background_tasks") { Agent::Config.new(max_background_tasks: -1) }
+    expect_raises(ArgumentError, "background_task_timeout") { Agent::Config.new(background_task_timeout: 0) }
+    config.max_task_result_chars.should eq 30_000
+    config.deliver_tasks_mid_turn?.should be_false
+    Agent::Config.new(max_task_result_chars: nil).max_task_result_chars.should be_nil
+    expect_raises(ArgumentError, "max_task_result_chars") { Agent::Config.new(max_task_result_chars: 0) }
+  end
+end

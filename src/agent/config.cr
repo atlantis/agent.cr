@@ -88,6 +88,30 @@ class Agent
     # Longest wait before a retry. A `Retry-After` beyond it isn't retried.
     getter retry_max_delay : Time::Span
 
+    # How many `Agent#background` tasks may run at once; one more raises
+    # `TaskLimitError`. 0 turns background tasks off.
+    getter max_background_tasks : Int32
+    # How long a background task may run before it is reported to the model
+    # as timed out. `Agent#background(timeout:)` overrides it per task.
+    getter background_task_timeout : Time::Span
+    # Longest task outcome delivered to the model whole. A longer one goes
+    # as its start and end around a line saying how much is missing, with
+    # `warning="truncated"` on the tag; `Task#result` keeps all of it. Nil
+    # delivers everything.
+    getter max_task_result_chars : Int32?
+    # Deliver a task's outcome right after tool results too: inside a tool
+    # loop still running, and with a manual `#ask(tool_results)`. Prompt,
+    # but it puts a user message directly after tool results, which some
+    # OpenAI-compatible backends (Mistral's API and templates) refuse, and
+    # a refused history stays refused. Off, outcomes wait for the next
+    # `#ask` of a user message or `#resume`, where they follow a reply.
+    getter? deliver_tasks_mid_turn : Bool
+    # Makes the id of each background task, when the default (`t-` and 12
+    # random hex characters) does not fit the application's scheme. Ids
+    # must be unique among the agent's tasks and are quoted by the model,
+    # so keep them short and plain.
+    getter task_id_generator : (-> String)?
+
     # Cached parsed URI — computed once at construction.
     getter parsed_uri : URI
 
@@ -121,6 +145,11 @@ class Agent
       @replay_reasoning : Bool = true,
       @prompt_caching : PromptCaching = PromptCaching::Explicit,
       @cache_ttl : CacheTTL = CacheTTL::FiveMinutes,
+      @max_background_tasks : Int32 = 4,
+      background_task_timeout : Time::Span | Int32 = 300,
+      @task_id_generator : (-> String)? = nil,
+      @max_task_result_chars : Int32? = 30_000,
+      @deliver_tasks_mid_turn : Bool = false,
     )
       validate_temperature(@temperature)
       validate_max_tokens(@max_tokens)
@@ -141,6 +170,9 @@ class Agent
       raise ArgumentError.new("max_retries must be non-negative, got #{@max_retries}") if @max_retries < 0
       @retry_base_delay = parse_timeout(retry_base_delay) || 1.second
       @retry_max_delay = parse_timeout(retry_max_delay) || 30.seconds
+
+      @background_task_timeout = parse_timeout(background_task_timeout) || 5.minutes
+      validate_background_tasks
 
       # Validate and parse the endpoint URI
       @parsed_uri = URI.parse(@api_endpoint)
@@ -172,6 +204,18 @@ class Agent
     private def validate_max_tool_iterations(mti : Int32?) : Nil
       if mti && mti < 1
         raise ArgumentError.new("max_tool_iterations must be >= 1, got #{mti}")
+      end
+    end
+
+    private def validate_background_tasks : Nil
+      if @max_background_tasks < 0
+        raise ArgumentError.new("max_background_tasks must be non-negative, got #{@max_background_tasks}")
+      end
+      unless @background_task_timeout > Time::Span.zero
+        raise ArgumentError.new("background_task_timeout must be positive, got #{@background_task_timeout}")
+      end
+      if (max = @max_task_result_chars) && max < 1
+        raise ArgumentError.new("max_task_result_chars must be positive, got #{max}")
       end
     end
 

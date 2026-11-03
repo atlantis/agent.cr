@@ -170,6 +170,11 @@ class Agent
         mime == "application/x-yaml"
     end
 
+    # Bytes of text and encoded data this part holds; see `Message#bytesize`.
+    def bytesize : Int64
+      [@text, @url, @data, @mime_type, @filename].sum(0_i64) { |s| s.try(&.bytesize) || 0 }
+    end
+
     # :nodoc:
     def to_json_body : Hash(String, JSON::Any)
       case @type
@@ -393,6 +398,53 @@ class Agent
     # `{"openai" => {"endpoint" => ..., "model" => ..., "reasoning_details" => [...]}}`.
     @[JSON::Field(key: "provider_data")]
     getter provider_data : JSON::Any?
+    # Where a user message came from. On the wire every one is `role: user`;
+    # this tells the application (a chat view, a log) which were typed by a
+    # person. Kept through `dump`/`load`.
+    @[JSON::Field(converter: Agent::Message::SourceConverter)]
+    getter source : Source = Source::Human
+
+    # Who wrote a user message. Not to be confused with `Role`: a message
+    # from the application is still `role: user` on the wire.
+    enum Source
+      # A person.
+      Human
+      # The application: an event, a notification, a scheduled prompt.
+      Application
+      # The outcome of a background `Task`, wrapped in `<task_result>`.
+      # Reserved for the agent; `Agent#ask` refuses it.
+      Task
+
+      def to_s : String
+        case self
+        in Human       then "human"
+        in Application then "application"
+        in Task        then "task"
+        end
+      end
+
+      def self.parse(value : String) : Source
+        case value.strip.downcase
+        when "human"       then Human
+        when "application" then Application
+        when "task"        then Task
+        else                    raise ArgumentError.new("Unknown message source: '#{value}'")
+        end
+      end
+    end
+
+    # :nodoc:
+    module SourceConverter
+      extend self
+
+      def to_json(value : Source, json : JSON::Builder) : Nil
+        json.string(value.to_s)
+      end
+
+      def from_json(value : JSON::PullParser) : Source
+        Source.parse(value.read_string)
+      end
+    end
 
     def initialize(
       @role : Role,
@@ -404,7 +456,50 @@ class Agent
       @reasoning : String? = nil,
       @is_error : Bool? = nil,
       @provider_data : JSON::Any? = nil,
+      @source : Source = Source::Human,
     )
+    end
+
+    # Whether this is a background task's result (see `Agent::Task`).
+    def task_result? : Bool
+      @role.user? && @source.task?
+    end
+
+    # The messages with each run of consecutive user messages joined into
+    # one. A background task's result lands before what the person typed
+    # next, as two messages in history; on the wire they go as one user
+    # message, since many OpenAI-compatible backends (Mistral and Llama
+    # chat templates, for one) refuse roles that don't alternate. Plain
+    # texts are joined with a blank line, so the content stays a string for
+    # servers that take nothing else; a message with parts (an image, a
+    # file) makes the joined content parts. Messages that carry different
+    # `name`s are left apart.
+    def self.coalesce_users(messages : Array(Message)) : Array(Message)
+      out = [] of Message
+      messages.each do |m|
+        last = out.last?
+        if last && m.role.user? && last.role.user? && last.name == m.name
+          out[-1] = last.join(m)
+        else
+          out << m
+        end
+      end
+      out
+    end
+
+    # This message followed by `other`, as one user message.
+    protected def join(other : Message) : Message
+      if @content_parts.nil? && other.content_parts.nil?
+        text = [@content, other.content].compact.join("\n\n")
+        Message.new(role: Role::User, content: text, name: @name, source: @source)
+      else
+        Message.new(role: Role::User, content_parts: parts + other.parts, name: @name, source: @source)
+      end
+    end
+
+    # The content as parts: `content_parts`, or the text as one part.
+    protected def parts : Array(ContentPart)
+      @content_parts || @content.try { |text| [ContentPart.new(type: :text, text: text)] } || [] of ContentPart
     end
 
     # Create a system message.
@@ -412,9 +507,9 @@ class Agent
       new(role: Role::System, content: content)
     end
 
-    # Create a user message.
-    def self.user(content : String) : self
-      new(role: Role::User, content: content)
+    # Create a user message. `source` says who wrote it; see `Source`.
+    def self.user(content : String, source : Source = Source::Human) : self
+      new(role: Role::User, content: content, source: source)
     end
 
     # Create an assistant message.
@@ -435,6 +530,28 @@ class Agent
       new(role: Role::Tool, content: content, tool_call_id: tool_call.id, name: tool_call.name, is_error: is_error)
     end
 
+    # Bytes of the strings this message holds: content and parts (an inline
+    # attachment counts whole), reasoning, tool calls and provider data. An
+    # estimate of its footprint, not of its tokens; see `Agent#footprint`.
+    def bytesize : Int64
+      bytes = [@content, @tool_call_id, @name, @reasoning].sum(0_i64) { |s| s.try(&.bytesize) || 0 }
+      bytes += @content_parts.try(&.sum(0_i64, &.bytesize)) || 0
+      bytes += @tool_calls.try(&.sum(0_i64) { |tc| tc.id.bytesize + tc.name.bytesize + tc.arguments.bytesize + Message.json_bytes(tc.provider_data) }) || 0
+      bytes + Message.json_bytes(@provider_data)
+    end
+
+    # Bytes of the strings inside a JSON value, without serialising it.
+    # :nodoc:
+    def self.json_bytes(value : JSON::Any?) : Int64
+      case raw = value.try(&.raw)
+      when String then raw.bytesize.to_i64
+      when Array  then raw.sum(0_i64) { |v| json_bytes(v) }
+      when Hash   then raw.sum(0_i64) { |k, v| k.bytesize + json_bytes(v) }
+      when Nil    then 0_i64
+      else             8_i64
+      end
+    end
+
     # Whether this is a tool result that reports an error.
     def error? : Bool
       @is_error == true
@@ -450,7 +567,8 @@ class Agent
         @content_parts == other.content_parts &&
         @tool_call_id == other.tool_call_id && @name == other.name &&
         @tool_calls == other.tool_calls && @reasoning == other.reasoning &&
-        @is_error == other.is_error && @provider_data == other.provider_data
+        @is_error == other.is_error && @provider_data == other.provider_data &&
+        @source == other.source
     end
 
     def ==(other) : Bool
@@ -460,6 +578,7 @@ class Agent
     def inspect(io : IO) : Nil
       io << "#<Message:"
       io << @role.to_s
+      io << '/' << @source.to_s unless @source.human?
       if c = @content
         io << " #{c[0, Math.min(c.size, 80)].inspect}"
       elsif @content_parts

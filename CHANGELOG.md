@@ -73,6 +73,44 @@
 
 ### Added
 
+- Background tasks. `Agent#background { |task| ... }` runs work in its own
+  fiber so a tool can answer at once with `Task#accepted` and the turn
+  ends; the outcome is delivered to the model as a `<task_result>` message
+  with the next `#ask` or the new `#resume` (or right after tool results
+  too, with `Config#deliver_tasks_mid_turn`). `Config#max_background_tasks`
+  (4) caps them, `Config#background_task_timeout` (5 minutes) bounds them,
+  `Config#task_id_generator` or `background(id:)` names them, and
+  `Task#on_cancel` hooks (run on cancel or timeout) plus
+  `Agent#cancel_task(id)` let a block kill the process it waits on;
+  `#discard_task(id)`, `#off_task_finished` and `Task#wait` round it out.
+  `#register_task_kind` names work that `#background(kind:, data:)` starts
+  and `#load` relaunches after a restart instead of reporting it lost. An
+  outcome longer than `Config#max_task_result_chars` (30,000) is delivered
+  as its start and end with `warning="truncated"` on the tag,
+  and `#on_task_finished`, `#awaiting_tasks?`, `#running_tasks` and
+  `#finished_tasks` let a scheduler park a conversation and come back.
+  Tasks survive `#dump` as records; one running when dumped is reported to
+  the model as lost. `Agent::Task::PROMPT_NOTE` explains the tag to the
+  model. A failed task reports `status="failed"` with an `Agent::ToolError`'s
+  message as the body; the exception is on `Task#error`, and a `Handler`
+  for the new `TaskContext` stage can replace the text the model reads.
+- `Agent#footprint`: message count and bytes of the history, and count and
+  result bytes of the background tasks held, for finding sessions that have
+  grown large. `Message#bytesize` and `ContentPart#bytesize` underneath.
+- `Message#source` (`human`, `application` or `task`) says who wrote a
+  user message, for the application; it is kept through `dump`/`load` and
+  never sent. `Agent#ask(text, source: :application)` marks an event the
+  application fed the model.
+
+### Changed
+
+- Consecutive user messages are sent as one user message on the wire (the
+  OpenAI provider joins plain texts with a blank line, and content parts
+  only when an attachment is among them; the Anthropic provider puts
+  everything between two assistant replies in one user turn). History
+  keeps them apart. Many OpenAI-compatible backends refuse roles that do
+  not alternate.
+
 - Prompt caching settings shared by providers: `Config#prompt_caching`
   (`:explicit`, the default; `:automatic`, where the API marks the
   conversation itself; `:off`) and `Config#cache_ttl` (`:five_minutes` or

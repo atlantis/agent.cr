@@ -38,6 +38,34 @@ class Agent
     end
   end
 
+  # Mutable context for a background task's outcome, as it is about to be
+  # delivered to the model. `result` is the text the model will read inside
+  # the `<task_result>` tag: `Task#result`, cut to
+  # `Config#max_task_result_chars` with `Task::Warning::Truncated` in
+  # `warnings` when it was longer. A handler can replace it, say to explain
+  # a failure from `error` (the exception that failed the task; an
+  # `Agent::ToolError`'s message is already there) or to shorten it
+  # differently, and add warnings of its own. The status attributes come
+  # from the task and are not changed by it.
+  class TaskContext
+    getter task : Task
+    property result : String?
+    property warnings : Array(Task::Warning)
+
+    def initialize(@task, max_chars : Int32? = nil)
+      @result = @task.result
+      @warnings = [] of Task::Warning
+      if max_chars && (text = @result)
+        @result, cut = Task.truncate(text, max_chars)
+        @warnings << Task::Warning::Truncated if cut
+      end
+    end
+
+    def error : Exception?
+      @task.error
+    end
+  end
+
   # Mutable context for an exception that escaped the pipeline.
   # Handlers may wrap or replace the error before it's recorded.
   # `error` is typed `Exception` because the generic rescue branch can land
@@ -69,6 +97,10 @@ class Agent
     end
 
     def handle(ctx : ToolCallContext, next_proc : ToolCallContext -> Message) : Message
+      next_proc.call(ctx)
+    end
+
+    def handle(ctx : TaskContext, next_proc : TaskContext -> Message) : Message
       next_proc.call(ctx)
     end
 
@@ -111,6 +143,10 @@ class Agent
       build_tool_call(@chain.each, block).call(context)
     end
 
+    def decorate(context : TaskContext, &block : TaskContext -> Message) : Message
+      build_task(@chain.each, block).call(context)
+    end
+
     def decorate(context : ErrorContext, &block : ErrorContext -> Agent::Error) : Agent::Error
       build_error(@chain.each, block).call(context)
     end
@@ -146,6 +182,16 @@ class Agent
       else
         rest = build_tool_call(iter, leaf)
         ->(ctx : ToolCallContext) { current.handle(ctx, rest) }
+      end
+    end
+
+    private def build_task(iter, leaf : TaskContext -> Message) : TaskContext -> Message
+      case current = iter.next
+      when Iterator::Stop
+        leaf
+      else
+        rest = build_task(iter, leaf)
+        ->(ctx : TaskContext) { current.handle(ctx, rest) }
       end
     end
 

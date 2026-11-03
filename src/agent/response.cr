@@ -98,6 +98,16 @@ class Agent
     @message : Message?
     @metadata : Usage?
 
+    # Whether this response repeats the latest reply instead of coming from
+    # a request: an `Agent#resume` that found nothing to deliver. No chunks
+    # stream and `metadata` is empty.
+    getter? from_history : Bool = false
+
+    # :nodoc:
+    def mark_from_history : Nil
+      synchronize { @from_history = true }
+    end
+
     def initialize
       @chunk_channel = Channel(Chunk).new(CHUNK_BUFFER)
       @message_channel = Channel(Message).new(1)

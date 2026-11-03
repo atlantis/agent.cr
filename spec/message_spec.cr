@@ -194,3 +194,56 @@ describe Agent::Message do
     Agent::Message.assistant("hi").should_not eq(msg)
   end
 end
+
+describe Agent::Message, "#bytesize" do
+  it "counts the strings a message holds, inline attachments included" do
+    Agent::Message.user("héllo").bytesize.should eq 6
+    tc = Agent::ToolCall.new("c1", "f", %({"a":1}), JSON::Any.new({"sig" => JSON::Any.new("xyz")}))
+    msg = Agent::Message.assistant("ok", tool_calls: [tc], reasoning: "why", provider_data: JSON::Any.new({"k" => JSON::Any.new("v")}))
+    msg.bytesize.should eq 2 + 3 + (2 + 1 + 7 + "sig".bytesize + "xyz".bytesize) + "k".bytesize + "v".bytesize
+    Agent::Message.json_bytes(JSON.parse(%({"a":[1,"bb",null,{"c":true}]}))).should eq 1 + 8 + 2 + 0 + 1 + 8
+    part = Agent::ContentPart.new(type: :image_url, url: "data:image/png;base64,#{"A" * 400}", mime_type: "image/png")
+    Agent::Message.new(role: :user, content_parts: [Agent::ContentPart.new(type: :text, text: "see"), part]).bytesize.should eq 3 + part.url.to_s.bytesize + "image/png".bytesize
+  end
+end
+
+describe Agent::Message::Source do
+  it "defaults to human, survives JSON, and stays off the wire" do
+    msg = Agent::Message.user("build finished", source: :application)
+    msg.source.application?.should be_true
+    msg.task_result?.should be_false
+    Agent::Message.user("hi").source.human?.should be_true
+
+    back = Agent::Message.from_json(msg.to_json)
+    back.source.application?.should be_true
+    back.should eq msg
+    Agent::Message.from_json(%({"role":"user","content":"old dump"})).source.human?.should be_true
+    msg.to_request_body.has_key?("source").should be_false
+
+    task = Agent::Message.user("<task_result>...</task_result>", source: :task)
+    task.task_result?.should be_true
+    task.inspect.should start_with "#<Message:user/task"
+    Agent::Message.assistant("x").should_not eq Agent::Message.new(role: :assistant, content: "x", source: :task)
+  end
+
+  it "joins runs of user messages into one: texts as one string, parts when an attachment is among them" do
+    task = Agent::Message.user("<task_result>done</task_result>", source: :task)
+    human = Agent::Message.user("and now?")
+    named = Agent::Message.new(role: :user, content: "x", name: "bob")
+    reply = Agent::Message.assistant("ok")
+    out = Agent::Message.coalesce_users([Agent::Message.user("hi"), reply, task, human, named])
+    out.map(&.role.to_s).should eq %w[user assistant user user]
+    out[2].content.should eq "<task_result>done</task_result>\n\nand now?"
+    out[2].content_parts.should be_nil
+    out[2].source.task?.should be_true
+    out[3].should eq named
+
+    image = Agent::Message.new(role: :user, content_parts: [Agent::ContentPart.new(type: :image_url, url: "https://x/y.png")])
+    blank = Agent::Message.new(role: :user)
+    out = Agent::Message.coalesce_users([task, image, blank, human])
+    out.size.should eq 1
+    out[0].content_parts.try(&.map(&.type.to_s)).should eq %w[Text ImageUrl Text]
+    out[0].content_parts.try(&.last.text).should eq "and now?"
+    Agent::Message.coalesce_users([blank, human])[0].content.should eq "and now?"
+  end
+end

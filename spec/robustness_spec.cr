@@ -238,7 +238,10 @@ describe "Agent robustness" do
       resp.error.should be_a(Agent::CancelledError)
 
       agent.ask("next").join
-      roles(requests.last).should eq(["user", "user"])
+      agent.history.map(&.role.to_s).should eq(["user", "user", "assistant"])
+      # consecutive user messages go as one on the wire
+      roles(requests.last).should eq(["user"])
+      requests.last["messages"][0]["content"].as_s.should eq("go\n\nnext")
     end
   end
 

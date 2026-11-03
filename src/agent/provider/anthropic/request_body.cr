@@ -108,25 +108,26 @@ class Agent
           JSON::Any.new(h)
         end
 
-        # The flat list into the API's turns. Consecutive tool results become
-        # one user turn of tool_result blocks, since parallel calls are
-        # answered in one message.
+        # The flat list into the API's turns. Everything between two assistant
+        # replies is one user turn: tool results (parallel calls are answered
+        # in one message) and then any user messages, such as a background
+        # task's result followed by what the person typed. The API would
+        # merge consecutive user turns itself; other backends refuse them.
         private def turns(messages : Array(Message), endpoint : String?) : Array(JSON::Any)
           turns = [] of JSON::Any
-          results = [] of JSON::Any
+          pending = [] of JSON::Any
           flush = -> {
-            unless results.empty?
-              turns << turn("user", results.dup)
-              results.clear
+            unless pending.empty?
+              turns << turn("user", pending.dup)
+              pending.clear
             end
           }
           messages.each do |m|
             case m.role
             in .tool?
-              results << tool_result(m)
+              pending << tool_result(m)
             in .user?
-              flush.call
-              turns << turn("user", user_blocks(m))
+              pending.concat(user_blocks(m))
             in .assistant?
               flush.call
               turns << turn("assistant", assistant_blocks(m, endpoint))

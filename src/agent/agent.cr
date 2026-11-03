@@ -23,6 +23,26 @@ class Agent
   getter session_id : String
   getter cache_key : String
 
+  # What an agent holds in memory, roughly: the history's messages and
+  # their bytes, and the background tasks (running, and finished but not
+  # yet delivered) with the bytes of their results. Cheap enough to poll,
+  # for finding the sessions that have grown large. The byte counts are of
+  # the strings held, not of the heap: close enough to compare sessions and
+  # set an alarm on, not exact.
+  record Footprint, messages : Int32, history_bytes : Int64, tasks : Int32, task_bytes : Int64 do
+    def bytes : Int64
+      history_bytes + task_bytes
+    end
+  end
+
+  # See `Footprint`. Thread-safe; takes each lock briefly.
+  def footprint : Footprint
+    messages, history_bytes = @history.lock { |h| {h.size, h.sum(0_i64, &.bytesize)} }
+    tasks = @tasks.lock(&.all)
+    task_bytes = tasks.sum(0_i64) { |t| (t.result.try(&.bytesize) || 0) + (t.description.try(&.bytesize) || 0) }
+    Footprint.new(messages, history_bytes, tasks.size, task_bytes)
+  end
+
   # Return a snapshot of the conversation history.
   # Thread-safe; acquires @history internally.
   def history : Array(Message)
@@ -39,6 +59,30 @@ class Agent
   # encoded in the type.
   @history : Sync::Exclusive(Array(Message))
   @registered_tools : Sync::Exclusive(Hash(String, NamedTuple(tool: Tool, callback: (Hash(String, JSON::Any) -> String)?, enabled: Bool)))
+
+  # Background tasks (see `Agent#background`): those running, and those
+  # finished whose outcome the model has not seen yet. One lock for both,
+  # so a check-and-move between them is atomic.
+  private class TaskState
+    getter running = [] of Task
+    getter finished = [] of Task
+
+    def all : Array(Task)
+      running + finished
+    end
+
+    def find(id : String) : Task?
+      all.find { |t| t.id == id }
+    end
+  end
+
+  @tasks : Sync::Exclusive(TaskState)
+  @task_callbacks : Sync::Exclusive(Array(Task ->))
+  # Named kinds of background work, relaunched after a restart.
+  @task_kinds : Sync::Exclusive(Hash(String, (Task -> String)))
+  # The tool call being executed, so a task it starts records its name.
+  # Agent fiber only.
+  @current_tool : String?
 
   # Persistent HTTP client for connection pooling across requests.
   @http_client : HTTP::Client
@@ -60,6 +104,10 @@ class Agent
       {} of String => NamedTuple(tool: Tool, callback: (Hash(String, JSON::Any) -> String)?, enabled: Bool)
     )
     @state_mutex = Sync::Mutex.new
+    @tasks = Sync::Exclusive(TaskState).new(TaskState.new)
+    @task_callbacks = Sync::Exclusive(Array(Task ->)).new([] of Task ->)
+    @task_kinds = Sync::Exclusive(Hash(String, (Task -> String))).new({} of String => (Task -> String))
+    @current_tool = nil
     @provider = provider || Provider::OpenAI.new(@config, @cache_key)
     @applied_read_timeout = nil
     @http_client = build_http_client
@@ -151,6 +199,187 @@ class Agent
   def close : Nil
     @state_mutex.synchronize { return if @closed; @closed = true }
     @request_channel.close
+    cancel_tasks
+  end
+
+  # Run `block` in its own fiber and return at once, so a tool can start slow
+  # work (a condition to poll, a long command) and answer the model with
+  # `Task#accepted` instead of blocking the turn. The block gets the `Task`,
+  # for `Task#sleep` and `Task#cancelled?`, and returns the text the model
+  # will see. When it returns, raises or hits its timeout, the outcome is
+  # queued and delivered to the model as a `<task_result>` message at the
+  # start of the next model call: the next `#ask` or `#resume`, or the next
+  # iteration of a tool loop still running. `#on_task_finished` says when
+  # that is worth doing.
+  #
+  # Only an `Agent::ToolError`'s message reaches the model; any other
+  # exception is logged and reported as "the task failed". A `Handler` sees
+  # the exception on `TaskContext#error` as the outcome is delivered and can
+  # set `TaskContext#result` to tell the model why. The default timeout is
+  # `Config#background_task_timeout`. A task cannot be killed:
+  # after its timeout or a cancel, the block should see `Task#cancelled?`
+  # and stop.
+  #
+  # Raises `TaskLimitError` when `Config#max_background_tasks` tasks are
+  # running, and `TaskIdError` for an id in use; from a tool callback both
+  # become an error result for the model.
+  #
+  # `id` names the task instead of `Config#task_id_generator` (or the
+  # default); it must not be that of a task running or awaiting delivery.
+  #
+  # ```
+  # agent.register_tool("wait_for_build", "Wait for a build to finish", parameters: schema) do |args|
+  #   id = args["id"].as_s
+  #   task = agent.background("build #{id} to finish", timeout: 30.minutes) do |t|
+  #     until build_done?(id)
+  #       break unless t.sleep(10.seconds)
+  #     end
+  #     build_done?(id) ? build_summary(id) : "build still running"
+  #   end
+  #   task.accepted
+  # end
+  # ```
+  def background(description : String? = nil, timeout : Time::Span? = nil, id : String? = nil, &block : Task -> String) : Task
+    start_task(description, timeout, id, nil, nil, block)
+  end
+
+  # Start a task of a registered kind (see `#register_task_kind`) with the
+  # data its block needs. Unlike a task given a block, it survives a
+  # restart: `#load` relaunches it from `kind` and `data` when the kind is
+  # registered. Raises `ArgumentError` for a kind that is not.
+  #
+  # ```
+  # agent.register_task_kind("wait_for_build") do |task|
+  #   id = task.data.not_nil!["id"].as_s
+  #   ...
+  # end
+  # agent.background("build 42 to finish", kind: "wait_for_build", data: JSON::Any.new({"id" => JSON::Any.new("42")}))
+  # ```
+  def background(description : String? = nil, timeout : Time::Span? = nil, id : String? = nil, *, kind : String, data : JSON::Any? = nil) : Task
+    block = @task_kinds.lock(&.[kind]?) || raise ArgumentError.new("no task kind '#{kind}' is registered")
+    start_task(description, timeout, id, kind, data, block)
+  end
+
+  # Name a kind of background work, so tasks of it can be started with
+  # `#background(kind:, data:)` and relaunched after a restart. The block
+  # gets the `Task`, whose `data` tells it what to do. Register kinds
+  # before `#load`, like tools.
+  def register_task_kind(kind : String, &block : Task -> String) : Nil
+    raise ArgumentError.new("task kind must not be empty") if kind.empty?
+    @task_kinds.lock { |k| k[kind] = block }
+  end
+
+  private def start_task(description : String?, timeout : Time::Span?, id : String?, kind : String?, data : JSON::Any?, block : Task -> String) : Task
+    @state_mutex.synchronize { raise ClosedError.new if @closed }
+    span = timeout || @config.background_task_timeout
+    raise ArgumentError.new("timeout must be positive, got #{span}") unless span > Time::Span.zero
+    id ||= @config.task_id_generator.try(&.call) || Task.generate_id
+    raise TaskIdError.new("task id must not be empty") if id.empty?
+
+    tool = Fiber.current == @fiber ? @current_tool : nil
+    task = Task.new(span, tool: tool, description: description, id: id, kind: kind, data: data)
+    @tasks.lock do |t|
+      raise TaskIdError.new("task id #{id} is already in use") if t.find(id)
+      raise TaskLimitError.new(@config.max_background_tasks) if t.running.size >= @config.max_background_tasks
+      t.running << task
+    end
+    run_task(task, block)
+    task
+  end
+
+  # Two fibers per task: the worker runs the block; the watcher finishes
+  # the task on the outcome, the timeout or a cancel, whichever is first.
+  private def run_task(task : Task, block : Task -> String) : Nil
+    done = Channel({Task::Status, String?, Exception?}).new(1)
+    spawn(name: "agent task #{task.id}") do
+      outcome = begin
+        {Task::Status::Done, block.call(task), nil}
+      rescue ex : ToolError
+        {Task::Status::Failed, ex.message, ex}
+      rescue ex
+        Log.error(exception: ex) { "Agent: background task #{task.id} raised" }
+        {Task::Status::Failed, "the task failed", ex}
+      end
+      done.send(outcome)
+    end
+    spawn(name: "agent task watch #{task.id}") do
+      select
+      when outcome = done.receive
+        task.finish(outcome[0], outcome[1], outcome[2])
+      when timeout(task.timeout)
+        task.finish(Task::Status::TimedOut, "timed out after #{Task.humanize(task.timeout)}")
+      when task.cancel_signal.receive?
+        # cancelled: already finished
+      end
+      task_finished(task)
+    end
+  end
+
+  # Background tasks still running.
+  def running_tasks : Array(Task)
+    @tasks.lock(&.running.dup)
+  end
+
+  # Cancel the running task with this id (see `Task#cancel`); it leaves
+  # `#running_tasks` at once. Returns false when no running task has it.
+  # For a tool that lets the model stop a task it started.
+  def cancel_task(id : String) : Bool
+    task = @tasks.lock { |t| t.running.find { |x| x.id == id }.try { |x| t.running.delete(x) } } || return false
+    task.cancel
+    true
+  end
+
+  # Drop a finished task's outcome before the model sees it. Returns false
+  # when no finished task has the id.
+  def discard_task(id : String) : Bool
+    !@tasks.lock { |t| t.finished.find { |x| x.id == id }.try { |x| t.finished.delete(x) } }.nil?
+  end
+
+  # Background tasks that ended whose outcome the model has not seen yet.
+  # `#resume` delivers them; so does the next `#ask`.
+  def finished_tasks : Array(Task)
+    @tasks.lock(&.finished.dup)
+  end
+
+  # Whether the conversation is waiting on background work: tasks running,
+  # or outcomes not yet delivered. A scheduler can park the conversation
+  # while this is true and come back on `#on_task_finished`.
+  def awaiting_tasks? : Bool
+    @tasks.lock { |t| !t.running.empty? || !t.finished.empty? }
+  end
+
+  # Call `block` from the task's fiber whenever a background task ends with
+  # an outcome for the model: done, failed or timed out, not cancelled. The
+  # usual follow-up is `#resume`. Returns the callback, for
+  # `#off_task_finished`.
+  def on_task_finished(&block : Task ->) : Task ->
+    @task_callbacks.lock(&.<< block)
+    block
+  end
+
+  # Remove a callback given to `#on_task_finished`. Returns false when it
+  # was not registered.
+  def off_task_finished(callback : Task ->) : Bool
+    !@task_callbacks.lock(&.delete(callback)).nil?
+  end
+
+  # Send the model the outcomes of finished background tasks, with no new
+  # user message, and return a Response immediately. Safe to call on a
+  # hunch: when nothing is waiting (a turn in progress delivered it, or
+  # nothing has finished) no request is made and the response finishes at
+  # once with the model's latest reply, `Response#from_history?` set and
+  # no usage; with no reply to repeat it finishes with an `Agent::Error`.
+  #
+  # Raises Agent::ClosedError if the agent has been closed via #close.
+  def resume(tools : Array(Tool)? = nil, reasoning_effort : ReasoningEffort? = nil) : Response
+    @state_mutex.synchronize { raise ClosedError.new if @closed }
+    refuse_from_agent_fiber("resume")
+
+    response = Response.new
+    @request_channel.send(AskRequest.new([] of Message, tools, response, RequestOptions.new(reasoning_effort: reasoning_effort)))
+    response
+  rescue Channel::ClosedError
+    raise ClosedError.new
   end
 
   # Send a user message and return a Response immediately.
@@ -172,15 +401,24 @@ class Agent
   #
   # `reasoning_effort` overrides `Config#reasoning_effort` for this request.
   #
+  # `source` records who wrote the message (see `Message::Source`): a
+  # person by default, or the application feeding the model an event.
+  # `Task` is the agent's own; passing it raises `ArgumentError`.
+  #
+  # Outcomes of finished background tasks (`#background`) are delivered
+  # ahead of the message.
+  #
   # Raises Agent::ClosedError if the agent has been closed via #close.
-  def ask(content : String, attachments : Array(String)? = nil, tools : Array(Tool)? = nil, reasoning_effort : ReasoningEffort? = nil) : Response
+  def ask(content : String, attachments : Array(String)? = nil, tools : Array(Tool)? = nil, reasoning_effort : ReasoningEffort? = nil, source : Message::Source = Message::Source::Human) : Response
     @state_mutex.synchronize { raise ClosedError.new if @closed }
+    refuse_from_agent_fiber("ask")
+    raise ArgumentError.new("source :task is reserved for background task results") if source.task?
 
     msg = if atts = attachments
             parts = [ContentPart.new(type: :text, text: content)] + atts.map { |path| ContentPart.from_path(path) }
-            Message.new(role: Role::User, content_parts: parts)
+            Message.new(role: Role::User, content_parts: parts, source: source)
           else
-            Message.new(role: Role::User, content: content)
+            Message.new(role: Role::User, content: content, source: source)
           end
 
     response = Response.new
@@ -196,6 +434,7 @@ class Agent
   # Raises Agent::ClosedError if the agent has been closed via #close.
   def ask(tool_results : Array(Message), tools : Array(Tool)? = nil, reasoning_effort : ReasoningEffort? = nil) : Response
     @state_mutex.synchronize { raise ClosedError.new if @closed }
+    refuse_from_agent_fiber("ask")
 
     response = Response.new
     @request_channel.send(AskRequest.new(tool_results, tools, response, RequestOptions.new(reasoning_effort: reasoning_effort)))
@@ -242,11 +481,13 @@ class Agent
     end
 
     enabled_names = parse_enabled_tools(parsed)
+    tasks = parse_tasks(parsed)
 
     @session_id = id
     @cache_key = key
 
-    load_history(history)
+    @history.lock { |h| h.clear; h.concat(history) }
+    adopt_tasks(tasks)
 
     @registered_tools.lock do |tools|
       enabled_names.each do |name|
@@ -301,7 +542,51 @@ class Agent
     raise SessionLoadError.new("'enabled_tools' field is not an array of strings", cause: ex)
   end
 
-  # Reset the conversation history back to the system prompt only.
+  # Background tasks from a dump, one per id. A cancelled one is nothing
+  # the model should hear about and is dropped.
+  private def parse_tasks(parsed : Hash(String, JSON::Any)) : Array(Task)
+    if tasks = parsed["tasks"]?
+      tasks.as_a.map { |t| Task.from_dump(t) }.reject(&.status.cancelled?).uniq!(&.id)
+    else
+      [] of Task
+    end
+  rescue ex
+    raise SessionLoadError.new("'tasks' field is malformed", cause: ex)
+  end
+
+  # Make the dumped tasks this agent's. A task the dump had running is kept
+  # if this agent is still running it (the dump was its own snapshot), and
+  # relaunched if its kind is registered; otherwise its fiber is gone and it
+  # is queued as `Lost`, so the model learns the result is never coming.
+  # Running tasks the dump does not know are the old conversation's and are
+  # cancelled.
+  private def adopt_tasks(dumped : Array(Task)) : Nil
+    kinds = @task_kinds.lock(&.dup)
+    relaunch = [] of {Task, (Task -> String)}
+    cancelled = @tasks.lock do |t|
+      alive = t.running.select { |x| dumped.any? { |d| d.running? && d.id == x.id } }
+      gone = t.running - alive
+      t.running.clear
+      t.running.concat(alive)
+      t.finished.clear
+      dumped.each do |d|
+        next if alive.any? { |x| x.id == d.id }
+        if d.running? && (block = d.kind.try { |k| kinds[k]? })
+          t.running << d
+          relaunch << {d, block}
+        else
+          d.finish(Task::Status::Lost, "this task did not survive a reload of the conversation") if d.running?
+          t.finished << d
+        end
+      end
+      gone
+    end
+    cancelled.each(&.cancel)
+    relaunch.each { |(task, block)| run_task(task, block) }
+  end
+
+  # Reset the conversation history back to the system prompt only. Running
+  # background tasks are cancelled and undelivered outcomes dropped.
   #
   # NOTE: Calling #reset while an #ask is in-flight is undefined behavior.
   # Wait for any in-flight Response to complete (via #join) first.
@@ -310,12 +595,14 @@ class Agent
   def reset : Nil
     @state_mutex.synchronize { raise ClosedError.new if @closed }
     @history.lock(&.clear)
+    cancel_tasks
   end
 
   # Restore the full conversation history.
   # This replaces the current history with the given messages (e.g. from a
   # previous `#dump`). The system prompt is NOT included — `build_messages`
-  # prepends it from Config as usual.
+  # prepends it from Config as usual. Background tasks of the replaced
+  # conversation are cancelled.
   #
   # NOTE: Calling #load_history while an #ask is in-flight is undefined behavior.
   # Wait for any in-flight Response to complete (via #join) first.
@@ -324,12 +611,46 @@ class Agent
   def load_history(messages : Array(Message)) : Nil
     @state_mutex.synchronize { raise ClosedError.new if @closed }
     @history.lock { |h| h.clear; h.concat(messages) }
+    cancel_tasks
+  end
+
+  # Background tasks belong to the conversation: a reset, a load or a close
+  # cancels the running ones and drops undelivered outcomes.
+  private def cancel_tasks : Nil
+    running = @tasks.lock { |t| taken = t.running.dup; t.running.clear; t.finished.clear; taken }
+    running.each(&.cancel)
+  end
+
+  # `#ask` and `#resume` wait for the agent fiber to take the request; from
+  # that fiber (a tool callback, a handler) they would wait for themselves.
+  private def refuse_from_agent_fiber(method : String) : Nil
+    return unless Fiber.current == @fiber
+    raise ArgumentError.new("Agent##{method} must not be called from the agent's own fiber (a tool callback or handler): it would wait for itself")
+  end
+
+  # Called from a task's watch fiber once it ended. A task no longer in the
+  # running list was taken by a cancel and is not the model's business.
+  protected def task_finished(task : Task) : Nil
+    queued = @tasks.lock do |t|
+      next false unless t.running.delete(task)
+      next false if task.status.cancelled?
+      t.finished << task
+      true
+    end
+    return unless queued
+    @task_callbacks.lock(&.dup).each do |cb|
+      cb.call(task)
+    rescue ex
+      Log.error(exception: ex) { "Agent: on_task_done callback raised" }
+    end
   end
 
   # Serialise the current session fields into an open JSON object.
   # Call this inside a `json.object` block managed by the caller.
   #
-  # Thread-safe; acquires @history and @registered_tools internally.
+  # Thread-safe; acquires @history and @registered_tools internally. A
+  # dump taken while a turn is in flight holds that turn's messages as
+  # sent so far, task outcomes delivered to it included.
   #
   # ```
   # JSON.build do |json|
@@ -354,6 +675,12 @@ class Agent
     unless tools.empty?
       json.field "enabled_tools", tools
     end
+
+    # Running tasks are dumped as they are; `load` marks them lost, since
+    # their fibers don't survive.
+    unless result.tasks.empty?
+      json.field "tasks", result.tasks
+    end
   end
 
   # Serialise the current session to a JSON string.
@@ -376,11 +703,13 @@ class Agent
   private def snapshot_session : DumpResult
     history_dup = @history.lock(&.dup)
     enabled_names = @registered_tools.lock(&.select { |_, v| v[:enabled] }.keys)
+    tasks = @tasks.lock(&.all)
     DumpResult.new(
       session_id: @session_id,
       cache_key: @cache_key,
       history: history_dup,
       enabled_tools: enabled_names,
+      tasks: tasks,
     )
   end
 
@@ -389,7 +718,8 @@ class Agent
     session_id : String,
     cache_key : String,
     history : Array(Message),
-    enabled_tools : Array(String)
+    enabled_tools : Array(String),
+    tasks : Array(Task)
 
   # Create an Agent and restore session state from previously dumped data.
   #
@@ -460,12 +790,23 @@ class Agent
     # finishing iteration's counts. Reported on failure too.
     total_usage = Usage.new
 
+    # Task outcomes delivered with this turn's first call; a rolled-back
+    # turn puts them back so the next one delivers them again.
+    delivered = [] of Task
+    incoming = request.new_messages
+
     begin
+      incoming = with_task_results(request.new_messages, delivered)
+      if incoming.empty?
+        answer_from_history(response)
+        return
+      end
+
       # Append new messages to history under the lock, then snapshot for the HTTP call.
       history_snapshot = @history.lock do |h|
-        close_dangling_tool_calls(h, request.new_messages)
+        close_dangling_tool_calls(h, incoming)
         start_size = h.size
-        h.concat(request.new_messages)
+        h.concat(incoming)
         h.dup
       end
       messages = build_messages(history_snapshot, [] of Message)
@@ -496,7 +837,7 @@ class Agent
         # On a genuine error (network/API/JSON), http_post_stream already called
         # response.finish_with_error.
         if response.error?
-          rollback_failed_turn(start_size, request.new_messages.size)
+          rollback_failed_turn(start_size, incoming.size, delivered)
           break
         end
 
@@ -512,6 +853,8 @@ class Agent
         end
 
         results = execute_registered_tools(tool_calls, response)
+        # Tasks that ended during this turn report after the tool results.
+        results = with_task_results(results)
 
         # Append tool results to history under the lock, then rebuild messages for next iteration.
         @history.lock(&.concat(results))
@@ -524,18 +867,76 @@ class Agent
       # hang every caller.
       Log.error(exception: ex) { "Agent: request failed" } unless ex.is_a?(Agent::Error)
       err = ex.is_a?(Agent::Error) ? ex : Agent::Error.new(ex.message || ex.class.name, cause: ex)
-      rollback_failed_turn(start_size, request.new_messages.size) unless response.finished?
+      rollback_failed_turn(start_size, incoming.size, delivered) unless response.finished?
       response.finish_with_error(err, total_usage)
     end
   end
 
+  # A resume with nothing to deliver: a turn in progress got there first,
+  # or nothing had finished. The model's latest reply answers it without a
+  # request; a conversation with no reply (empty, or waiting on the
+  # caller's own tool results) gets an error, never a request it did not
+  # ask for.
+  private def answer_from_history(response : Response) : Nil
+    last = @history.lock(&.last?)
+    if last && last.role.assistant?
+      response.mark_from_history
+      response.finish(last, Usage.new)
+    else
+      response.finish_with_error(Agent::Error.new("nothing to deliver: no finished task, and no reply to repeat"))
+    end
+  end
+
   # A turn that fails before the model replied produced nothing: drop the
-  # messages it added. Once a reply is in history, tools may have run, so
-  # the turn is kept; any call left unanswered is answered at the start of
-  # the next turn.
-  private def rollback_failed_turn(start_size : Int32?, added : Int32) : Nil
+  # messages it added, and queue the task outcomes among them again. Once a
+  # reply is in history, tools may have run, so the turn is kept; any call
+  # left unanswered is answered at the start of the next turn.
+  private def rollback_failed_turn(start_size : Int32?, added : Int32, delivered : Array(Task)) : Nil
     return unless start_size
-    @history.lock { |h| h.pop(h.size - start_size) if start_size < h.size <= start_size + added }
+    rolled_back = @history.lock do |h|
+      next false unless start_size < h.size <= start_size + added
+      h.pop(h.size - start_size)
+      true
+    end
+    return if !rolled_back || delivered.empty?
+    @tasks.lock do |t|
+      later = t.finished.dup
+      t.finished.clear
+      t.finished.concat(delivered).concat(later)
+    end
+  end
+
+  # `incoming` with a `<task_result>` message per finished background task
+  # added. A batch with tool results gets them only when
+  # `Config#deliver_tasks_mid_turn?` allows, after the last tool result:
+  # those must directly follow the assistant message that called them, and
+  # some backends refuse a user message right after them. Delivered tasks
+  # are appended to `delivered`.
+  private def with_task_results(incoming : Array(Message), delivered : Array(Task)? = nil) : Array(Message)
+    return incoming if incoming.any?(&.role.tool?) && !@config.deliver_tasks_mid_turn?
+    finished = @tasks.lock(&.finished.dup)
+    return incoming if finished.empty?
+
+    messages = finished.map { |task| task_message(task) }
+    @tasks.lock(&.finished.reject! { |t| finished.includes?(t) })
+    delivered.try(&.concat(finished))
+
+    at = (incoming.rindex(&.role.tool?) || -1) + 1
+    incoming[0, at] + messages + incoming[at..]
+  end
+
+  # The task's outcome through the `TaskContext` handlers. A handler that
+  # raises is logged and the outcome delivered as it is: one bad handler
+  # must not block the conversation.
+  private def task_message(task : Task) : Message
+    ctx = TaskContext.new(task, @config.max_task_result_chars)
+    begin
+      @handlers.decorate(ctx) { |c| c.task.to_message(c.result, c.warnings) }
+    rescue ex
+      Log.error(exception: ex) { "Agent: TaskContext handler raised for task #{task.id}; delivering the outcome as it is" }
+      fallback = TaskContext.new(task, @config.max_task_result_chars)
+      task.to_message(fallback.result, fallback.warnings)
+    end
   end
 
   # Give every tool call of the last assistant message that has no result
@@ -634,18 +1035,45 @@ class Agent
   # results. The oldest turns are dropped whole until at most `max_history`
   # remain, so the kept history always starts at a user message and no
   # tool result is ever left without the assistant message that called it.
+  # A background task's result belongs to the turn it arrived in: ahead of
+  # the next user message, or after the tool results of a turn in progress.
   private def trim_history! : Nil
     @history.replace do |h|
       max = @config.max_history
       next h unless max && max > 0
 
-      starts = [] of Int32
-      h.each_with_index { |m, idx| starts << idx if m.role == Role::User }
+      starts = turn_starts(h)
       next h if starts.size <= max
 
       first_kept = starts[starts.size - max]
       h[first_kept..]
     end
+  end
+
+  # Where each turn begins: a run of consecutive user messages starts a
+  # turn at its first message, unless the run follows tool results, where
+  # the task results at its head still belong to the turn in progress and
+  # the first other message starts the new one.
+  private def turn_starts(h : Array(Message)) : Array(Int32)
+    starts = [] of Int32
+    idx = 0
+    while idx < h.size
+      unless h[idx].role.user?
+        idx += 1
+        next
+      end
+      run_end = idx
+      while run_end < h.size && h[run_end].role.user?
+        run_end += 1
+      end
+      if idx > 0 && h[idx - 1].role.tool?
+        (idx...run_end).find { |i| !h[i].task_result? }.try { |i| starts << i }
+      else
+        starts << idx
+      end
+      idx = run_end
+    end
+    starts
   end
 
   # Execute all tool calls that have registered callbacks.
@@ -712,6 +1140,7 @@ class Agent
         failed = false
         result = if cb = entry[:callback]
                    begin
+                     @current_tool = ctx.tool_call.name
                      cb.call(args_hash)
                    rescue ex : ToolError
                      failed = true
@@ -722,6 +1151,8 @@ class Agent
                      ctx.error = ex
                      Log.error(exception: ex) { "Agent: tool '#{ctx.tool_call.name}' raised" }
                      "Error executing tool '#{ctx.tool_call.name}': the tool failed"
+                   ensure
+                     @current_tool = nil
                    end
                  else
                    failed = true

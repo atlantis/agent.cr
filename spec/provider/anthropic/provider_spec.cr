@@ -101,6 +101,25 @@ describe Agent::Provider::Anthropic do
       block["cache_control"]["type"].should eq "ephemeral"
     end
 
+    it "joins tool results, a task's result and the next user message into one turn" do
+      call = Agent::ToolCall.new(id: "toolu_1", name: "wait", arguments: "{}")
+      messages = [
+        Agent::Message.user("wait for it"),
+        Agent::Message.assistant(nil, tool_calls: [call]),
+        Agent::Message.tool_result(call, "Started background task t-1"),
+        Agent::Message.user("<task_result id=\"t-1\" status=\"done\">it happened</task_result>", source: :task),
+        Agent::Message.user("great, continue"),
+      ]
+      turns = body_of(anthropic, messages)["messages"].as_a
+      turns.map(&.["role"].as_s).should eq %w[user assistant user]
+      blocks = turns[2]["content"].as_a
+      blocks.map(&.["type"].as_s).should eq %w[tool_result text text]
+      blocks[1]["text"].as_s.should contain "it happened"
+      blocks[2]["text"].should eq "great, continue"
+      blocks[2]["cache_control"]["type"].should eq "ephemeral"
+      blocks[1]["cache_control"]?.should be_nil
+    end
+
     it "moves a later system message into the system prompt" do
       messages = [
         Agent::Message.system("Base."),

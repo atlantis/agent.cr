@@ -22,6 +22,7 @@ src/
     message.cr           # Agent::Message, ContentPart, ToolCall, Usage
     response.cr          # Agent::Response — async handle with stream/join/finished
     tool.cr              # Agent::Tool / FunctionDef (extracted from agent.cr)
+    task.cr              # Agent::Task — background work a tool starts, delivered later
     agent.cr             # Agent — fiber loop, history, tool resolution (no HTTP/SSE code)
     provider.cr          # requires provider/ modules
     provider/
@@ -459,6 +460,32 @@ agent.register_tool("get_time", "Get the current time",
 resp = agent.ask(input)
 resp.stream { |chunk| print chunk }
 ```
+
+## Background tasks
+
+`Agent#background` runs a block in its own fiber; the tool answers with
+`Task#accepted` and the outcome reaches the model later as a `role: user`,
+`source: task` message wrapped in `<task_result>`. Invariants worth knowing:
+
+- Outcomes are delivered only in the agent fiber, at the start of a turn.
+  Never right after tool results unless `deliver_tasks_mid_turn` is on:
+  `tool → user` is refused by Mistral-style backends and a refused history
+  stays refused.
+- An outcome is never lost, sent twice, or able to block the conversation:
+  a raising `TaskContext` handler falls back to the raw outcome, a
+  rolled-back first call re-queues, and `task_finished` queues only what it
+  could remove from `running` (a cancel removes first). Both task lists
+  share one lock for this.
+- `#resume` never makes a request on its own; `#ask`/`#resume` from the
+  agent fiber raise instead of deadlocking.
+- A closure cannot survive a restart: `load` relaunches only tasks whose
+  `kind` is registered (`register_task_kind`), the rest become `Lost`.
+- A task cannot be killed: cancel and timeout close its channel and run
+  `on_cancel` hooks in their own fiber; the block must cooperate.
+- `turn_starts` keeps a task result with the turn it arrived in, so
+  trimming never splits one off.
+- Providers join consecutive user messages into one on the wire, since
+  Mistral and Llama templates refuse non-alternating roles.
 
 ## Future considerations
 

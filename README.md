@@ -142,6 +142,19 @@ Start a fresh conversation without creating a new agent:
 agent.reset
 ```
 
+### Footprint
+
+`agent.footprint` says how much an agent holds, cheaply enough to poll across every live session and alarm on the ones that have grown: the history's message count and bytes, and the background tasks still running or awaiting delivery with the bytes of their results. The counts are of the strings held, not the heap, so they compare sessions and set a threshold rather than measure exactly.
+
+```crystal
+fp = agent.footprint
+fp.messages      # 42
+fp.history_bytes # 318_204 — an inline image attachment counts whole
+fp.tasks         # 1
+fp.task_bytes    # 20_480
+fp.bytes         # history_bytes + task_bytes
+```
+
 ### History trimming
 
 Set `max_history` to limit the number of conversation turns kept in memory. A turn is a user message and everything up to the next one (the assistant's reply, and with tools, its tool calls and their results); the oldest turns are dropped whole, so the kept history always starts at a user message and no tool result is ever orphaned.
@@ -310,6 +323,112 @@ saved = File.read("session.json")
 agent.load(saved)  # warnings for tools not re-registered
 ```
 
+### Background tasks
+
+A tool that has to wait, for a build to finish, a condition to hold or a slow command to return, need not hold the conversation. `Agent#background` runs a block in its own fiber, and the tool answers at once with `Task#accepted`. The model ends its turn and the agent is free for other work. When the block returns, raises or hits its timeout, the outcome is queued and delivered to the model at the start of the next model call: the next `#ask`, a `#resume`, or the next iteration of a tool loop that is still running.
+
+```crystal
+agent.register_tool("wait_for_build", "Wait for a build to finish", parameters: schema) do |args|
+  id = args["id"].as_s
+  task = agent.background("build #{id} to finish", timeout: 30.minutes) do |t|
+    until build_done?(id)
+      break unless t.sleep(10.seconds) # false once cancelled or timed out
+    end
+    build_done?(id) ? build_summary(id) : "build still running"
+  end
+  task.accepted # "Started background task t-3fa9c1d2 (build 42 to finish). It times out after 30m. ..."
+end
+
+resp = agent.ask("Tell me when build 42 is done")
+resp.message.content # => "I'll let you know once it finishes."
+
+# Fires from the task's fiber; park the conversation until then.
+agent.on_task_finished { |task| scheduler.wake(conversation_id) }
+
+# Later, when the scheduler comes back to this conversation. Safe even if
+# nothing is waiting: then no request is made and the response repeats the
+# model's latest reply, with `from_history?` set.
+agent.resume.message.content # => "Build 42 passed: 312 tests, 0 failures."
+```
+
+The outcome reaches the model as a user-role message whose content is wrapped in a tag it can tell from a person's words:
+
+```
+<task_result id="t-3fa9c1d2" tool="wait_for_build" description="build 42 to finish" status="done" elapsed="2m 14s">
+passed: 312 tests, 0 failures
+</task_result>
+```
+
+`status` is `done`, `failed`, `timed_out` or `lost` (the agent was restarted while the task ran). Add `Agent::Task::PROMPT_NOTE` to the system prompt so the model knows the tag and does not poll for results. `Message#source` tells the application which user messages are a person's (`human`), the application's (`application`, via `ask(text, source: :application)`) or a task's (`task`); it is kept through `dump`/`load` and never goes on the wire.
+
+Limits and lifecycle:
+
+- `Config#max_background_tasks` (default 4) caps the tasks running per agent. One more raises `Agent::TaskLimitError`, which from a tool callback becomes an error result the model can act on.
+- `Config#background_task_timeout` (default 5 minutes; seconds or a `Time::Span`) is the timeout; `background(timeout:)` overrides it per task.
+- A fiber cannot be killed, so stopping is cooperative. `Task#cancel`, `Agent#cancel_task(id)` or a timeout make `Task#cancelled?` true and `Task#sleep` return false, and run the task's `Task#on_cancel` hooks in a fiber of their own, where a block tears down what it is blocked on:
+
+  ```crystal
+  agent.background("the test suite", timeout: 20.minutes) do |task|
+    process = Process.new("make", ["test"], output: out = IO::Memory.new, error: out)
+    task.on_cancel { process.terminate }
+    status = process.wait
+    raise Agent::ToolError.new("make test exited #{status.exit_code}:\n#{out}") unless status.success?
+    out.to_s
+  end
+  ```
+- A failure is reported with `status="failed"`. Only an `Agent::ToolError`'s message reaches the model as the body; any other exception is logged and reported as "the task failed". A `Handler` for `TaskContext` runs as each outcome is delivered: it sees the exception on `ctx.error` and can set `ctx.result` to tell the model why, or to shorten a long output and keep the whole for a tool of yours to read or search later. A handler that raises is logged and the outcome delivered as it is.
+- `#reset`, `#load` and `#close` cancel every running task of the agent and drop undelivered outcomes. `#dump` records tasks; one still running when dumped comes back as `lost`, so the model learns its result is never coming.
+- Outcomes are delivered with the next `#ask` of a user message or `#resume`, where they follow a reply. `Config#deliver_tasks_mid_turn` (off by default) also delivers them right after tool results, inside a tool loop still running or with a manual `ask(tool_results)`. That is prompter, but a user message directly after tool results is refused by some OpenAI-compatible backends (Mistral's API and chat templates), and once such a history exists every later request fails; turn it on for backends you know accept it.
+- `#awaiting_tasks?` is true while tasks run or outcomes wait; `#running_tasks` and `#finished_tasks` list them, `Task#wait` blocks until one ends, and `#discard_task(id)` drops an outcome before the model sees it. `#on_task_finished` returns its callback for `#off_task_finished`.
+- Task ids are `t-` and 12 random hex characters. `Config#task_id_generator` (a `-> String`) substitutes your own scheme, and `background(id:)` names one task; an id still running or awaiting delivery raises `Agent::TaskIdError`, which the model sees when it happens inside a tool.
+- `#ask` and `#resume` raise when called from the agent's own fiber (inside a tool callback or handler), since they would wait for themselves.
+
+#### Restarts
+
+A task is a closure, so it cannot survive the process. After a restart `load` queues each task the dump had running as `status="lost"`, and the model is told its result is never coming. To do better, define the work once under a name and start tasks by name and data; `load` then relaunches them from the dump:
+
+```crystal
+agent.register_task_kind("wait_for_build") do |task|
+  id = task.data.not_nil!["id"].as_s
+  until build_done?(id)
+    break unless task.sleep(10.seconds)
+  end
+  build_done?(id) ? build_summary(id) : "build still running"
+end
+
+agent.register_tool("wait_for_build", "Wait for a build to finish", parameters: schema) do |args|
+  agent.background("build #{args["id"]} to finish", kind: "wait_for_build", data: args["id"]).accepted
+end
+```
+
+Register kinds before `load`, as with tools. A relaunched task keeps its id, description and start time, so the model's earlier acknowledgement still matches; its timeout starts over. `data` is kept through dump and load and never shown to the model. Only tasks whose work is safe to run again should have a kind; anything else is better left to become `lost`.
+
+#### Long outputs
+
+An outcome longer than `Config#max_task_result_chars` (30,000 by default; nil for no limit) is delivered as its start and end around a line saying how much is missing, and the tag carries `warning="truncated"` so the model knows it is not seeing everything. `Task#result` keeps the whole. That is a backstop, not a plan: a task that produces a lot (a log, a test run, a crawl) should return what matters and keep the rest where a tool can reach it. The model already knows the task id, so key the store by it and register tools to read or search it on demand. This is how Claude Code handles its own background tasks: a short notification, and the full output in a file the model greps only if it needs to.
+
+```crystal
+outputs = {} of String => String
+
+agent.register_tool("run_tests", "Run the test suite in the background", parameters: schema) do
+  agent.background("the test suite", timeout: 20.minutes) do |task|
+    log = run_suite(task)                       # the whole output
+    outputs[task.id] = log
+    failures = log.lines.select(&.starts_with?("FAIL"))
+    "#{failures.size} failures out of #{log.lines.size} lines:\n#{failures.first(10).join("\n")}"
+  end.accepted
+end
+
+agent.register_tool("search_task_output", "Search a task's full output", parameters: search_schema) do |args|
+  log = outputs[args["task_id"].as_s]? || raise Agent::ToolError.new("no output for that task")
+  log.lines.select(&.includes?(args["pattern"].as_s)).first(50).join("\n")
+end
+```
+
+A `TaskContext` handler can apply the same split after the fact, shortening `ctx.result` and stowing the original, when the task code is not yours to change; `ctx.warnings` is where it says so.
+
+Two user messages in a row (an outcome, then what the person typed) go as one user message on the wire, since many OpenAI-compatible backends refuse roles that do not alternate. Plain texts are joined with a blank line, so the content stays a string; it becomes content parts only when an attachment is among them.
+
 ### Disable auto-resolve
 
 To handle tool calls manually (e.g. only some tools are registered, or you need user approval):
@@ -377,13 +496,14 @@ Then pass it to `#ask`: `agent.ask("...", tools: [weather_tool])` — see the ma
 
 ### Architecture
 
-Four context types correspond to the four pipeline stages. A `Handler` subclass overrides the `handle` overloads it cares about; each receives the context and a `next_proc` that invokes the rest of the chain:
+Five context types correspond to the five pipeline stages. A `Handler` subclass overrides the `handle` overloads it cares about; each receives the context and a `next_proc` that invokes the rest of the chain:
 
 | Context | Stage | Attack surface |
 |---|---|---|
 | `TurnContext` | Before the HTTP request is built | Mutate `ctx.messages` and `ctx.tools` before they're sent to the model |
 | `ChunkContext` | Each streamed SSE delta | Replace `ctx.chunk` to rewrite tokens in-flight |
 | `ToolCallContext` | Before a tool callback is executed | Approve/deny tool execution, cancel the response |
+| `TaskContext` | As a background task's outcome is delivered to the model | Replace `ctx.result`: explain a failure from `ctx.error`, shorten a long output |
 | `ErrorContext` | After an exception escapes the pipeline | Wrap or replace the error before it's recorded |
 
 ### Writing a handler
