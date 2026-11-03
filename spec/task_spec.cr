@@ -476,6 +476,9 @@ describe Agent::Task do
 
       agent.complete_task("nope", "x").should be_false
       agent.complete_task(task.id, "deploy 42 is serving on 3 nodes").should be_true
+      # queued before complete returns, not when the watcher fiber gets to run
+      agent.finished_tasks.should eq [task]
+      agent.running_tasks.should be_empty
       agent.complete_task(task.id, "again").should be_false
       await(agent, task)
       task.status.done?.should be_true
@@ -488,6 +491,7 @@ describe Agent::Task do
 
       failed = agent.background("a check")
       agent.fail_task(failed.id, "the rollback did not take: 2 containers still Down").should be_true
+      agent.finished_tasks.should eq [failed]
       await(agent, failed)
       failed.status.failed?.should be_true
       failed.result.should eq "the rollback did not take: 2 containers still Down"
@@ -496,6 +500,31 @@ describe Agent::Task do
       slow = agent.background("never reported", timeout: 20.milliseconds)
       await(agent, slow)
       slow.status.timed_out?.should be_true
+    end
+  end
+
+  it "queues an outcome the application produced on its own" do
+    with_script([text_reply("ok")]) do |agent, requests|
+      started = Time.utc - 3.minutes
+      task = Agent::Task.new(45.minutes, tool: "rollback", description: "rollback of 42 to settle", id: "fu-9", started_at: started)
+      expect_raises(ArgumentError, "still running") { agent.queue_task(task) }
+      task.fail("the rollback did not take: 2 containers still Down")
+      agent.queue_task(task)
+      expect_raises(Agent::TaskIdError, "fu-9 is already in use") { agent.queue_task(task) }
+      agent.awaiting_tasks?.should be_true
+
+      cancelled = Agent::Task.new(1.minute, id: "fu-10")
+      cancelled.cancel
+      expect_raises(ArgumentError, "cancelled") { agent.queue_task(cancelled) }
+
+      JSON.parse(agent.dump)["tasks"].as_a.map(&.["id"].as_s).should eq ["fu-9"]
+
+      agent.resume.message.content.should eq "ok"
+      text = text_of(requests[0]["messages"][0])
+      text.should contain %(<task_result id="fu-9" tool="rollback" description="rollback of 42 to settle" status="failed" elapsed="3m">)
+      text.should contain "the rollback did not take"
+      agent.history.first.source.task?.should be_true
+      agent.awaiting_tasks?.should be_false
     end
   end
 

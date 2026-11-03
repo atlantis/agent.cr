@@ -87,7 +87,9 @@
   and `#load` relaunches after a restart instead of reporting it lost.
   `#background` without a block returns a task the application finishes
   with `Task#complete`/`#fail` (or `#complete_task`/`#fail_task` by id),
-  for outcomes produced outside the agent; it survives `#load`. An
+  for outcomes produced outside the agent; it survives `#load`.
+  `#queue_task` delivers a `Task` the application built and finished
+  itself, for applications that load a conversation only to run a turn. An
   outcome longer than `Config#max_task_result_chars` (30,000) is delivered
   as its start and end with `warning="truncated"` on the tag,
   and `#on_task_finished`, `#awaiting_tasks?`, `#running_tasks` and

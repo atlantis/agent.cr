@@ -272,6 +272,33 @@ class Agent
     @tasks.lock { |t| t.running.find { |x| x.id == id } }.try(&.fail(reason, error)) || false
   end
 
+  # Queue the outcome of a task the application ran and finished entirely
+  # on its own, for the next `#ask` or `#resume`: `Task.new(...)` then
+  # `Task#complete` or `#fail`, then this. For an application that keeps
+  # its own record of pending work and loads a conversation only to run a
+  # turn, so no agent was there when the outcome arrived. The model reads
+  # the same `<task_result>` as for any task. `#on_task_finished` callbacks
+  # are not called: the caller knows.
+  #
+  # Raises `ArgumentError` for a task still running or cancelled, and
+  # `TaskIdError` for an id in use.
+  #
+  # ```
+  # task = Agent::Task.new(45.minutes, tool: "rollback", description: "rollback of 42 to settle",
+  #   id: row.task_id, started_at: row.started_at)
+  # task.fail("the rollback did not take: 2 containers still Down")
+  # agent.queue_task(task)
+  # agent.resume
+  # ```
+  def queue_task(task : Task) : Nil
+    raise ArgumentError.new("queue_task takes a finished task; #{task.id} is still running") if task.running?
+    raise ArgumentError.new("a cancelled task has no outcome to queue") if task.status.cancelled?
+    @tasks.lock do |t|
+      raise TaskIdError.new("task id #{task.id} is already in use") if t.find(task.id)
+      t.finished << task
+    end
+  end
+
   # Start a task of a registered kind (see `#register_task_kind`) with the
   # data its block needs. Unlike a task given a block, it survives a
   # restart: `#load` relaunches it from `kind` and `data` when the kind is
@@ -307,6 +334,7 @@ class Agent
 
     tool = Fiber.current == @fiber ? @current_tool : nil
     task = Task.new(span, tool: tool, description: description, id: id, kind: kind, data: data, external: block.nil?)
+    task.on_finish = ->task_finished(Task)
     @tasks.lock do |t|
       raise TaskIdError.new("task id #{id} is already in use") if t.find(id)
       raise TaskLimitError.new(@config.max_background_tasks) if t.running.size >= @config.max_background_tasks
@@ -621,7 +649,10 @@ class Agent
       gone
     end
     cancelled.each(&.cancel)
-    relaunch.each { |(task, block, remaining)| run_task(task, block, remaining) }
+    relaunch.each do |(task, block, remaining)|
+      task.on_finish = ->task_finished(Task)
+      run_task(task, block, remaining)
+    end
   end
 
   # Reset the conversation history back to the system prompt only. Running

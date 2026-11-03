@@ -104,6 +104,11 @@ class Agent
     # Whether the application finishes this task (`#complete`, `#fail`)
     # rather than a block: an outcome produced outside the agent.
     getter? external : Bool
+    # Set by the agent running the task: called with it, at once and in the
+    # finishing fiber, when `#complete` or `#fail` end it, so the outcome is
+    # queued before either returns.
+    # :nodoc:
+    property on_finish : (Task ->)?
 
     @status = Status::Running
     @result : String? = nil
@@ -123,13 +128,18 @@ class Agent
     # or to end a block's early: its `#sleep` then returns false. Returns
     # false if the task had already ended.
     def complete(result : String) : Bool
-      finish(Status::Done, result)
+      finish(Status::Done, result) && notify_finish
     end
 
     # End the task as failed; `reason` is what the model reads. Returns
     # false if the task had already ended.
     def fail(reason : String, error : Exception? = nil) : Bool
-      finish(Status::Failed, reason, error)
+      finish(Status::Failed, reason, error) && notify_finish
+    end
+
+    private def notify_finish : Bool
+      @on_finish.try(&.call(self))
+      true
     end
 
     # Random, 12 hex characters: short enough for the model to quote, and
