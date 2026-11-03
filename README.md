@@ -399,7 +399,7 @@ agent.complete_task(id, "deployment 42 reverted; the service has no alarm")
 agent.fail_task(id, "the rollback did not take: 2 containers still Down")
 ```
 
-The model reads the same `<task_result>` as for any task, so it needs no second format, and the outcome goes through the same handlers, cap, limit, timeout, cancel and `dump`. `complete` and `fail` queue the outcome before they return, so "load, complete, ask" delivers it in that turn.
+The model reads the same `<task_result>` as for any task, so it needs no second format, and the outcome goes through the same handlers, cap, limit, timeout, cancel and `dump`. `complete` and `fail` queue the outcome before they return, so "load, complete, ask" delivers it in that turn. A task like this still running when dumped stays running after `load`, with the time it had left, for your checker to finish; one whose time ran out while the process was down times out at once. `Task#complete` also ends a block's task early: its `Task#sleep` returns false. If a success needs no words from the model, `discard_task(id)` after completing drops the outcome unread.
 
 An application that keeps its own record of pending work and loads a conversation only to run a turn has no agent to complete when the outcome arrives. It builds the record itself and queues it as it loads:
 
@@ -409,7 +409,7 @@ task = Agent::Task.new(45.minutes, tool: "rollback", description: row.descriptio
 task.fail("the rollback did not take: 2 containers still Down")
 agent.queue_task(task)
 agent.resume
-``` A task like this still running when dumped stays running after `load`, with the time it had left, for your checker to finish; one whose time ran out while the process was down times out at once. `Task#complete` also ends a block's task early: its `Task#sleep` returns false. If a success needs no words from the model, `discard_task(id)` after completing drops the outcome unread.
+```
 
 #### Restarts
 
